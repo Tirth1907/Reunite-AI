@@ -1,0 +1,18 @@
+credentials:
+  usernames:
+    admin:
+      email: admin@reuniteai.demo
+      name: Reunite Admin
+      city: Bhopal
+      area: VIT Bhopal
+      role: Admin
+      password: '$2b$12$ByZbwxrcvCXVLQO4zjI95OteXToaBiwWDqujsHiKfeGzionz0VqAG'  # password: abc
+
+cookie:
+  expiry_days: 1
+  key: reunite_ai_signature_key
+  name: reunite_ai_cookie
+
+preauthorized:
+  emails:
+    - admin@reuniteai.demo

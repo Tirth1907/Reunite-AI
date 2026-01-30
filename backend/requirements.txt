@@ -1,0 +1,28 @@
+# FastAPI Backend Dependencies for Reunite AI 1.5
+
+# Web framework
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+
+# File uploads
+python-multipart==0.0.9
+
+# Database ORM
+sqlmodel==0.0.22
+
+# Authentication
+pyjwt==2.9.0
+passlib[bcrypt]==1.7.4
+email-validator==2.3.0
+
+# Image processing
+Pillow==10.4.0
+numpy==2.0.2
+
+# Face recognition
+deepface
+tf-keras
+dlib==19.24.6
+
+# YAML config
+pyyaml==6.0.2

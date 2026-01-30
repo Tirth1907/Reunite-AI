@@ -1,0 +1,7 @@
+2026-01-30 15:06:42,235 - INFO - --- [VERIFICATION] STEP 1: Starting Incremental Match for public case: ec63b015-a96e-44ba-958a-2698e03de615 ---
+2026-01-30 15:06:42,235 - INFO - [VERIFICATION] Fetching target case context...
+2026-01-30 15:06:42,242 - INFO - [VERIFICATION] Found Target Public Case: ec63b015-a96e-44ba-958a-2698e03de615 (Encoding Len: 512)
+2026-01-30 15:06:42,244 - INFO - [VERIFICATION] Fetched 2 Registered Cases as candidates.
+2026-01-30 15:06:42,244 - INFO - --- [VERIFICATION] STEP 2: Comparing against 2 candidates ---
+2026-01-30 15:06:42,245 - INFO - [VERIFICATION] STEP 5 SANITY: Best Distance = 1.0000 (Threshold: 0.6)
+2026-01-30 15:06:42,247 - INFO - [VERIFICATION] No match found. Best candidate was 58f79a2c-a318-431e-8abf-873bdca569a5 at 1.0000
