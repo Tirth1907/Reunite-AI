@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Outlet, Link, useLocation, useNavigate } from 'react-router-dom';
-import { Heart, Home, FileText, Users, GitCompare, Smartphone, Menu, X, LogOut, User } from 'lucide-react';
+import { Heart, Home, FileText, Users, GitCompare, Smartphone, Menu, X, LogOut, User, Eye } from 'lucide-react';
 import { useAuth } from '@/app/context/AuthContext';
 
 export default function DashboardLayout() {
@@ -15,6 +15,7 @@ export default function DashboardLayout() {
     { name: 'All Cases', href: '/dashboard/all-cases', icon: Users },
     { name: 'Match Cases', href: '/dashboard/match-cases', icon: GitCompare },
     { name: 'Mobile App', href: '/dashboard/mobile-app', icon: Smartphone },
+    { name: 'Public Sightings', href: '/dashboard/sightings', icon: Eye },
   ];
 
   const isActive = (href: string) => {

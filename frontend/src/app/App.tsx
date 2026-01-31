@@ -11,6 +11,7 @@ import RegisterCase from '@/app/pages/dashboard/RegisterCase';
 import AllCases from '@/app/pages/dashboard/AllCases';
 import MatchCases from '@/app/pages/dashboard/MatchCases';
 import MobileApp from '@/app/pages/dashboard/MobileApp';
+import PublicSightings from '@/app/pages/dashboard/PublicSightings';
 
 export default function App() {
   return (
@@ -21,7 +22,7 @@ export default function App() {
           <Route path="/login" element={<LoginPage />} />
           <Route path="/signup" element={<SignUpPage />} />
           <Route path="/forgot-password" element={<ForgotPasswordPage />} />
-          
+
           <Route path="/dashboard" element={
             <ProtectedRoute>
               <DashboardLayout />
@@ -32,6 +33,7 @@ export default function App() {
             <Route path="all-cases" element={<AllCases />} />
             <Route path="match-cases" element={<MatchCases />} />
             <Route path="mobile-app" element={<MobileApp />} />
+            <Route path="sightings" element={<PublicSightings />} />
           </Route>
         </Routes>
       </BrowserRouter>

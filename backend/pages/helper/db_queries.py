@@ -134,26 +134,28 @@ def fetch_public_cases(train_data: bool, status: str):
     # create_db()
     if train_data:
         with Session(engine) as session:
-            result = session.exec(
-                select(
-                    PublicSubmissions.id,
-                    PublicSubmissions.face_mesh,
-                ).where(PublicSubmissions.status == status)
-            ).all()
+            query = select(PublicSubmissions.id, PublicSubmissions.face_mesh)
+            if status != "All":
+                query = query.where(PublicSubmissions.status == status)
+            
+            result = session.exec(query).all()
             return result
 
     with Session(engine) as session:
+        query = select(
+            PublicSubmissions.id,
+            PublicSubmissions.status,
+            PublicSubmissions.location,
+            PublicSubmissions.mobile,
+            PublicSubmissions.birth_marks,
+            PublicSubmissions.submitted_on,
+            PublicSubmissions.submitted_by,
+        )
+        if status != "All":
+            query = query.where(PublicSubmissions.status == status)
+            
         result = session.exec(
-            select(
-                PublicSubmissions.id,
-                PublicSubmissions.status,
-                PublicSubmissions.location,
-                PublicSubmissions.mobile,
-                PublicSubmissions.birth_marks,
-                PublicSubmissions.submitted_on,
-                PublicSubmissions.submitted_by,
-            )
-            .order_by(PublicSubmissions.submitted_on.desc())
+            query.order_by(PublicSubmissions.submitted_on.desc())
         ).all()
         return result
 

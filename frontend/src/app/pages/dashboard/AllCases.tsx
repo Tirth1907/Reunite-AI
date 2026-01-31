@@ -18,7 +18,7 @@ export default function AllCases() {
       setIsLoading(true);
       setError(null);
       try {
-        const data = await getCases();
+        const data = await getCases({ status: 'All' });
         setCases(data);
       } catch (err) {
         console.error('Failed to fetch cases:', err);

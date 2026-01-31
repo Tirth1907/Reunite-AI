@@ -8,6 +8,7 @@ export default function LoginPage() {
   const navigate = useNavigate();
   const [showPassword, setShowPassword] = useState(false);
   const { login } = useAuth();
+  const [isLoading, setIsLoading] = useState(false);
   const [formData, setFormData] = useState({
     email: '',
     password: '',
@@ -15,15 +16,18 @@ export default function LoginPage() {
   });
 
   const handleSubmit = async (e: React.FormEvent) => {
-  e.preventDefault();
+    e.preventDefault();
+    setIsLoading(true);
 
-  try {
-    await login(formData.email, formData.password);
-    navigate('/dashboard');
-  } catch (error) {
-    console.error('Login failed', error);
-  }
-};
+    try {
+      await login(formData.email, formData.password);
+      navigate('/dashboard');
+    } catch (error) {
+      console.error('Login failed', error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
 
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col">
@@ -121,10 +125,11 @@ export default function LoginPage() {
 
               <button
                 type="submit"
-                className="w-full py-3 rounded-lg text-white font-medium transition-all hover:shadow-lg"
+                disabled={isLoading}
+                className="w-full py-3 rounded-lg text-white font-medium transition-all hover:shadow-lg relative z-10 disabled:opacity-70 disabled:cursor-not-allowed"
                 style={{ backgroundColor: '#1e1b4b' }}
               >
-                Sign In
+                {isLoading ? 'Signing In...' : 'Sign In'}
               </button>
             </form>
 

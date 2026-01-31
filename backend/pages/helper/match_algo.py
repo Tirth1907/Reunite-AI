@@ -161,8 +161,13 @@ def match(tolerance: float = DEFAULT_TOLERANCE):
             logger.info(f"MATCH: Public {pub_id} -> Registered {best_match_id} (Dist: {min_distance:.4f})")
             
             # Persist match to database
+            confidence = (1.0 - min_distance) * 100
             try:
-                db_queries.update_matched_with(best_match_id, pub_id)
+                if confidence >= 85:
+                    db_queries.update_found_status(best_match_id, pub_id)
+                    logger.info(f"MATCH: AUTO-VERIFIED {best_match_id} <-> {pub_id} (Confidence: {confidence:.2f}%)")
+                else:
+                    db_queries.update_matched_with(best_match_id, pub_id)
             except Exception as e:
                 logger.error(f"Failed to persist match for {best_match_id}: {e}")
 
@@ -285,8 +290,13 @@ def match_one_against_all(case_id: str, case_type: str = "public", tolerance: fl
         pub_id = case_id if case_type == "public" else best_match_id
         
         try:
-            db_queries.update_matched_with(reg_id, pub_id)
-            logger.info(f"[VERIFICATION] DB Update Successful for {reg_id} <--> {pub_id}")
+            confidence = (1.0 - min_distance) * 100
+            if confidence >= 85:
+                db_queries.update_found_status(reg_id, pub_id)
+                logger.info(f"[VERIFICATION] AUTO-VERIFIED {reg_id} <-> {pub_id} (Confidence: {confidence:.2f}%)")
+            else:
+                db_queries.update_matched_with(reg_id, pub_id)
+                logger.info(f"[VERIFICATION] DB Update Successful for {reg_id} <-> {pub_id}")
         except Exception as e:
             logger.error(f"[VERIFICATION] Failed to persist match: {e}")
             

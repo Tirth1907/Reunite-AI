@@ -1,6 +1,7 @@
 import { Link } from 'react-router-dom';
 import { Heart, Users, Search, Bell, CheckCircle, MapPin, Clock, ArrowRight } from 'lucide-react';
 import { mockMissingPersons, statistics } from '@/data/mockData';
+import { CountUp } from '../components/CountUp';
 
 export default function LandingPage() {
   const recentStories = mockMissingPersons.slice(0, 3);
@@ -92,27 +93,27 @@ export default function LandingPage() {
           <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-6">
             <div className="bg-white rounded-xl p-6 shadow-lg text-center transition-transform hover:scale-105">
               <div className="text-4xl font-bold mb-2" style={{ color: '#ef4444' }}>
-                {statistics.yearlyMissing.toLocaleString()}+
+                <CountUp end={860000} suffix="+" />
               </div>
               <div className="text-gray-600">People go missing annually in India</div>
             </div>
             <div className="bg-white rounded-xl p-6 shadow-lg text-center transition-transform hover:scale-105">
               <div className="text-4xl font-bold mb-2" style={{ color: '#f59e0b' }}>
-                {statistics.unresolvedPercentage}%
+                <CountUp end={47} suffix="%" />
               </div>
               <div className="text-gray-600">Cases remain unresolved</div>
             </div>
             <div className="bg-white rounded-xl p-6 shadow-lg text-center transition-transform hover:scale-105">
               <div className="text-4xl font-bold mb-2" style={{ color: '#ef4444' }}>
-                {statistics.childrenAffected}%
+                <CountUp end={16} suffix="%" />
               </div>
               <div className="text-gray-600">Are children under 18</div>
             </div>
             <div className="bg-white rounded-xl p-6 shadow-lg text-center transition-transform hover:scale-105">
               <div className="text-4xl font-bold mb-2" style={{ color: '#f59e0b' }}>
-                {statistics.elderlyAffected}%
+                <CountUp end={67} suffix="%" />
               </div>
-              <div className="text-gray-600">Are elderly with medical conditions</div>
+              <div className="text-gray-600">Are women</div>
             </div>
           </div>
         </div>

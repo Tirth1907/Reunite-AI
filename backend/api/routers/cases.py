@@ -71,7 +71,7 @@ def extract_face_encoding_from_image(image_bytes: bytes) -> Optional[list]:
 
 @router.get("", response_model=List[CaseResponse])
 async def list_cases(
-    status: Optional[str] = "All",
+    status: Optional[str] = "NF",
     submitted_by: Optional[str] = None,
     limit: Optional[int] = None,
 ):

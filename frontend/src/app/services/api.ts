@@ -167,12 +167,17 @@ export interface PublicSubmission {
     photo_url?: string;
 }
 
-export async function getPublicSubmissions(): Promise<PublicSubmission[]> {
-    return apiRequest<PublicSubmission[]>('/public');
+export async function getPublicSubmissions(status?: string): Promise<PublicSubmission[]> {
+    const query = status ? `?status=${status}` : '';
+    return apiRequest<PublicSubmission[]>(`/public${query}`);
 }
 
 export async function getPublicSubmission(id: string): Promise<PublicSubmission> {
     return apiRequest<PublicSubmission>(`/public/${id}`);
+}
+
+export async function deletePublicSubmission(id: string): Promise<{ status: string; id: string }> {
+    return apiRequest(`/public/${id}`, { method: 'DELETE' });
 }
 
 export async function submitSighting(formData: FormData): Promise<PublicSubmission> {
@@ -243,6 +248,7 @@ const api = {
     // Public
     getPublicSubmissions,
     submitSighting,
+    deletePublicSubmission,
 
     // Matching
     runMatching,

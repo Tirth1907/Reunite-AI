@@ -31,6 +31,8 @@ export default function MatchCases() {
 
       for (const m of stored) {
         if (!m.matched_with || !m.id) continue;
+        // Safety filter: Exclude users marked as Found
+        if (m.status === 'F' || m.status === 'Found' || m.status === 'found') continue;
 
         // We have the registered case (m) and the public ID (m.matched_with)
         try {
@@ -76,6 +78,9 @@ export default function MatchCases() {
         try {
           // Fetch registered case details
           const registeredCase = await getCase(regId);
+
+          // Safety filter: Exclude users marked as Found
+          if (registeredCase.status === 'F' || registeredCase.status === 'Found' || registeredCase.status === 'found') continue;
 
           // For each public match for this case
           for (const match of publicMatches) {

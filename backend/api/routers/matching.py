@@ -54,18 +54,23 @@ async def run_matching(tolerance: float = 0.5):
         )
 
 
+class ConfirmMatchRequest(BaseModel):
+    registered_case_id: str
+    public_case_id: str
+
+
 @router.post("/matching/confirm")
-async def confirm_match(registered_case_id: str, public_case_id: str):
+async def confirm_match(request: ConfirmMatchRequest):
     """
     Confirm a match between a registered case and public submission.
     Updates both records to 'Found' status.
     """
     try:
-        db_queries.update_found_status(registered_case_id, public_case_id)
+        db_queries.update_found_status(request.registered_case_id, request.public_case_id)
         return {
             "status": "confirmed",
-            "registered_case_id": registered_case_id,
-            "public_case_id": public_case_id,
+            "registered_case_id": request.registered_case_id,
+            "public_case_id": request.public_case_id,
         }
     except Exception as e:
         return {
@@ -137,6 +142,7 @@ async def get_recent_matches():
             matched_cases = session.exec(
                 select(RegisteredCases)
                 .where(RegisteredCases.matched_with.is_not(None))
+                .where(RegisteredCases.status == "NF")
                 .order_by(RegisteredCases.submitted_on.desc())
                 .limit(10)
             ).all()

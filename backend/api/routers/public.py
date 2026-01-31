@@ -63,10 +63,10 @@ def extract_face_encoding_from_image(image_bytes: bytes) -> Optional[list]:
 
 
 @router.get("", response_model=List[PublicSubmissionResponse])
-async def list_public_submissions():
-    """List all public submissions/sightings."""
+async def list_public_submissions(status: Optional[str] = "NF"):
+    """List public submissions/sightings. use status='All' for everything."""
     try:
-        cases = db_queries.fetch_public_cases(train_data=False, status="NF")
+        cases = db_queries.fetch_public_cases(train_data=False, status=status)
         
         result = []
         for case in cases:
@@ -186,5 +186,23 @@ async def delete_submission(submission_id: str):
             os.remove(photo_path)
         
         return {"status": "deleted", "id": submission_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/{submission_id}/status")
+async def get_submission_status(submission_id: str):
+    """Get status of a public submission."""
+    try:
+        result = db_queries.get_public_submission_basic(submission_id)
+        if not result:
+            raise HTTPException(status_code=404, detail="Submission not found")
+        
+        return {
+            "id": result[0], 
+            "status": result[1]
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
