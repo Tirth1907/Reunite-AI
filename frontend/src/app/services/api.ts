@@ -229,6 +229,100 @@ export async function getRecentMatches(): Promise<Case[]> {
     return apiRequest<Case[]>('/matches');
 }
 
+// ============ Video Analysis API (Phase 2) ============
+
+const API_BASE_V2 = 'http://localhost:8000/api/v2';
+
+export interface VideoUploadResponse {
+    video_id: string;
+    case_id: string;
+    status: string;
+    message: string;
+}
+
+export interface VideoStatus {
+    video_id: string;
+    status: string;
+    total_frames: number | null;
+    processed_frames: number;
+    total_detections: number;
+    progress_percent: number;
+    error_message: string | null;
+}
+
+export interface Detection {
+    id: string;
+    video_id: string;
+    video_location: string | null;
+    timestamp_seconds: number;
+    timestamp_display: string;
+    confidence: number;
+    cropped_face_url: string;
+    detected_at: string | null;
+}
+
+export interface VideoResults {
+    case_id: string;
+    case_name: string | null;
+    total_videos_analyzed: number;
+    detections: Detection[];
+}
+
+export async function uploadVideo(formData: FormData): Promise<VideoUploadResponse> {
+    const token = localStorage.getItem('reunite_token');
+    const headers: Record<string, string> = {};
+    if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+    }
+
+    const response = await fetch(`${API_BASE_V2}/video/upload`, {
+        method: 'POST',
+        headers,
+        body: formData,
+    });
+
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({ detail: 'Upload failed' }));
+        throw new Error(error.detail || `HTTP error ${response.status}`);
+    }
+
+    return response.json();
+}
+
+export async function getVideoStatus(videoId: string): Promise<VideoStatus> {
+    const token = localStorage.getItem('reunite_token');
+    const headers: Record<string, string> = {};
+    if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+    }
+
+    const response = await fetch(`${API_BASE_V2}/video/status/${videoId}`, { headers });
+
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({ detail: 'Status check failed' }));
+        throw new Error(error.detail || `HTTP error ${response.status}`);
+    }
+
+    return response.json();
+}
+
+export async function getVideoResults(caseId: string): Promise<VideoResults> {
+    const token = localStorage.getItem('reunite_token');
+    const headers: Record<string, string> = {};
+    if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+    }
+
+    const response = await fetch(`${API_BASE_V2}/video/results/${caseId}`, { headers });
+
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({ detail: 'Results fetch failed' }));
+        throw new Error(error.detail || `HTTP error ${response.status}`);
+    }
+
+    return response.json();
+}
+
 // ============ Default Export ============
 
 const api = {
@@ -254,6 +348,11 @@ const api = {
     runMatching,
     confirmMatch,
     getRecentMatches,
+
+    // Video Analysis (Phase 2)
+    uploadVideo,
+    getVideoStatus,
+    getVideoResults,
 };
 
 export default api;

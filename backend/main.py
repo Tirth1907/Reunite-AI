@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 import os
 
 # Import routers
-from api.routers import auth, cases, public, matching
+from api.routers import auth, cases, public, matching, video
 
 # Import database initialization
 from pages.helper.db_queries import create_db
@@ -49,11 +49,16 @@ resources_path = os.path.join(os.path.dirname(__file__), "resources")
 if os.path.exists(resources_path):
     app.mount("/resources", StaticFiles(directory=resources_path), name="resources")
 
+# Mount video uploads directory for direct video access (Phase 2)
+video_uploads_path = os.path.join(os.path.dirname(__file__), "video_uploads")
+os.makedirs(video_uploads_path, exist_ok=True)
+
 # Include API routers
 app.include_router(auth.router, prefix="/api/v1/auth", tags=["Authentication"])
 app.include_router(cases.router, prefix="/api/v1/cases", tags=["Registered Cases"])
 app.include_router(public.router, prefix="/api/v1/public", tags=["Public Submissions"])
 app.include_router(matching.router, prefix="/api/v1", tags=["Matching & Statistics"])
+app.include_router(video.router, prefix="/api/v2/video", tags=["Video Analysis (Phase 2)"])
 
 
 @app.get("/")

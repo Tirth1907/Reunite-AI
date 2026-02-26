@@ -12,6 +12,7 @@ import AllCases from '@/app/pages/dashboard/AllCases';
 import MatchCases from '@/app/pages/dashboard/MatchCases';
 import MobileApp from '@/app/pages/dashboard/MobileApp';
 import PublicSightings from '@/app/pages/dashboard/PublicSightings';
+import VideoAnalysis from '@/app/pages/dashboard/VideoAnalysis';
 
 export default function App() {
   return (
@@ -34,6 +35,7 @@ export default function App() {
             <Route path="match-cases" element={<MatchCases />} />
             <Route path="mobile-app" element={<MobileApp />} />
             <Route path="sightings" element={<PublicSightings />} />
+            <Route path="video-analysis" element={<VideoAnalysis />} />
           </Route>
         </Routes>
       </BrowserRouter>

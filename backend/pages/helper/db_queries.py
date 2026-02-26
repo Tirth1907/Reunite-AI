@@ -1,7 +1,9 @@
 
 from sqlmodel import create_engine, Session, select
 
-from pages.helper.data_models import RegisteredCases, PublicSubmissions
+from pages.helper.data_models import (
+    RegisteredCases, PublicSubmissions, VideoUploads, VideoDetections
+)
 
 sqlite_url = "sqlite:///sqlite_database.db"
 engine = create_engine(sqlite_url)
@@ -15,12 +17,12 @@ logger = logging.getLogger(__name__)
 
 def create_db():
     """Create tables if they do not already exist."""
-    try:
-        RegisteredCases.__table__.create(engine)
-        PublicSubmissions.__table__.create(engine)
-    except Exception:
-        # Tables already exist – ignore
-        pass
+    for model in [RegisteredCases, PublicSubmissions, VideoUploads, VideoDetections]:
+        try:
+            model.__table__.create(engine)
+        except Exception:
+            # Table already exists – ignore
+            pass
 
 
 def register_new_case(case_details: RegisteredCases):
@@ -347,3 +349,100 @@ def delete_public_case(case_id: str):
         if case:
             session.delete(case)
             session.commit()
+
+
+# ============================================================
+# Phase 2 — Video Analysis Queries
+# ============================================================
+
+def create_video_upload(upload: VideoUploads):
+    """Insert a new video upload record."""
+    with Session(engine) as session:
+        session.add(upload)
+        session.commit()
+        session.refresh(upload)
+        return upload
+
+
+def get_video_upload(video_id: str):
+    """Fetch a single video upload by ID."""
+    with Session(engine) as session:
+        return session.get(VideoUploads, video_id)
+
+
+def update_video_status(
+    video_id: str,
+    status: str,
+    processed_frames: int = None,
+    total_frames: int = None,
+    total_detections: int = None,
+    error_message: str = None,
+    completed_at=None,
+):
+    """Update video upload status and progress counters."""
+    with Session(engine) as session:
+        upload = session.get(VideoUploads, video_id)
+        if not upload:
+            return
+        upload.status = status
+        if processed_frames is not None:
+            upload.processed_frames = processed_frames
+        if total_frames is not None:
+            upload.total_frames = total_frames
+        if total_detections is not None:
+            upload.total_detections = total_detections
+        if error_message is not None:
+            upload.error_message = error_message
+        if completed_at is not None:
+            upload.completed_at = completed_at
+        session.add(upload)
+        session.commit()
+
+
+def save_video_detection(detection: VideoDetections):
+    """Insert a single video detection record."""
+    with Session(engine) as session:
+        session.add(detection)
+        session.commit()
+
+
+def save_video_detections_batch(detections: list):
+    """Insert multiple video detection records in one transaction."""
+    if not detections:
+        return
+    with Session(engine) as session:
+        for det in detections:
+            session.add(det)
+        session.commit()
+
+
+def get_video_detections_by_case(case_id: str):
+    """Fetch all video detections for a given case, ordered by confidence descending."""
+    with Session(engine) as session:
+        results = session.exec(
+            select(VideoDetections)
+            .where(VideoDetections.case_id == case_id)
+            .order_by(VideoDetections.confidence.desc())
+        ).all()
+        return results
+
+
+def get_video_uploads_by_case(case_id: str):
+    """Fetch all video uploads analyzed for a given case."""
+    with Session(engine) as session:
+        results = session.exec(
+            select(VideoUploads)
+            .where(VideoUploads.case_id == case_id)
+            .order_by(VideoUploads.uploaded_at.desc())
+        ).all()
+        return results
+
+
+def get_case_embedding(case_id: str):
+    """Fetch the face_mesh embedding for a registered case."""
+    with Session(engine) as session:
+        result = session.exec(
+            select(RegisteredCases.face_mesh)
+            .where(RegisteredCases.id == case_id)
+        ).first()
+        return result
