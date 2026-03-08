@@ -19,6 +19,10 @@ from pages.helper.data_models import PublicSubmissions
 
 router = APIRouter()
 
+# Absolute path to resources directory — matches the static mount in main.py
+RESOURCES_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "resources")
+os.makedirs(RESOURCES_DIR, exist_ok=True)
+
 
 class PublicSubmissionResponse(BaseModel):
     id: str
@@ -103,9 +107,8 @@ async def submit_sighting(
     photo_bytes = await photo.read()
     submission_id = str(uuid.uuid4())
     photo_filename = f"{submission_id}.jpg"
-    photo_path = os.path.join("resources", photo_filename)
+    photo_path = os.path.join(RESOURCES_DIR, photo_filename)
     
-    os.makedirs("resources", exist_ok=True)
     with open(photo_path, "wb") as f:
         f.write(photo_bytes)
     
@@ -181,7 +184,7 @@ async def delete_submission(submission_id: str):
         db_queries.delete_public_case(submission_id)
         
         # Also delete photo if exists
-        photo_path = os.path.join("resources", f"{submission_id}.jpg")
+        photo_path = os.path.join(RESOURCES_DIR, f"{submission_id}.jpg")
         if os.path.exists(photo_path):
             os.remove(photo_path)
         

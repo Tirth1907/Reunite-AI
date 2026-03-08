@@ -36,11 +36,14 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-FRAME_INTERVAL_SECONDS = 1        # Extract one frame every 1 second (more chances to catch good angles)
+FRAME_INTERVAL_SECONDS = 3        # Extract one frame every 3 seconds (balances speed vs coverage)
 TARGET_MAX_WIDTH = 1280            # Max width (only downscale, never upscale)
 TARGET_MAX_HEIGHT = 720            # Max height
-DEFAULT_CONFIDENCE_THRESHOLD = 0.85  # Cosine distance threshold (relaxed for CCTV conditions)
+DEFAULT_CONFIDENCE_THRESHOLD = 0.40  # Cosine distance threshold (distance <= 0.40 = confidence >= 60%)
 PROGRESS_UPDATE_INTERVAL = 10     # Update DB progress every N frames
+SUPPRESSION_WINDOW_SEC = 3        # Suppress similar consecutive detections within this gap
+SUPPRESSION_SIMILARITY = 0.10     # Cosine distance below this = same face (skip)
+MIN_CONFIDENCE_PERCENT = 60       # Hard floor: never save detections below this confidence
 MAX_VIDEO_SIZE_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 
 # Directories
@@ -122,6 +125,39 @@ def _ensure_deepface():
 # Core helpers
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Haar cascade pre-filter (lightweight face check ~3-5ms per frame)
+# ---------------------------------------------------------------------------
+_haar_cascade = None
+
+
+def _get_haar_cascade():
+    """Lazy-load the OpenCV Haar cascade for fast face pre-filtering."""
+    global _haar_cascade
+    if _haar_cascade is None:
+        cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        _haar_cascade = cv2.CascadeClassifier(cascade_path)
+    return _haar_cascade
+
+
+def _has_faces_fast(frame_bgr):
+    """
+    Lightweight pre-filter using OpenCV Haar cascade.
+    Returns True if at least one face-like region is detected.
+    Runs in ~3-5ms, used to skip expensive DeepFace on empty frames.
+    """
+    cascade = _get_haar_cascade()
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    faces = cascade.detectMultiScale(
+        gray,
+        scaleFactor=1.3,
+        minNeighbors=3,
+        minSize=(30, 30),
+        flags=cv2.CASCADE_SCALE_IMAGE,
+    )
+    return len(faces) > 0
+
+
 def _cosine_distance(a, b):
     """Cosine distance between two vectors. Returns 0.0 (identical) to 2.0."""
     a = np.asarray(a, dtype=np.float64)
@@ -150,16 +186,10 @@ def _detect_and_embed(frame_rgb):
     faces = []
 
     # Strategy list: (detector_backend, enforce, align, label)
-    # Prioritize enforce_detection=True to avoid garbage embeddings
+    # Only 2 strategies — Haar pre-filter already confirmed a face exists
     strategies = [
         ("retinaface", True, True, "retina+enforce+align"),
-        ("retinaface", True, False, "retina+enforce-noalign"),
         ("opencv", True, True, "opencv+enforce+align"),
-        ("opencv", True, False, "opencv+enforce-noalign"),
-        ("retinaface", False, True, "retina-noenforce+align"),
-        ("retinaface", False, False, "retina-noenforce-noalign"),
-        ("opencv", False, True, "opencv-noenforce+align"),
-        ("opencv", False, False, "opencv-noenforce-noalign"),
     ]
 
     for detector, enforce, align, label in strategies:
@@ -296,6 +326,13 @@ def process_video(video_id: str):
     file_path = upload.file_path
     threshold = upload.confidence_threshold
 
+    # Clamp: never allow distance threshold above MATCH_DISTANCE_THRESHOLD
+    if threshold > DEFAULT_CONFIDENCE_THRESHOLD:
+        logger.warning(
+            f"[VIDEO] Clamping user threshold {threshold} -> {DEFAULT_CONFIDENCE_THRESHOLD}"
+        )
+        threshold = DEFAULT_CONFIDENCE_THRESHOLD
+
     # ---- Update status to processing ----
     db_queries.update_video_status(video_id, status="processing")
 
@@ -349,6 +386,14 @@ def process_video(video_id: str):
         detections_buffer = []
         processed = 0
         detection_count = 0
+        skipped_no_face = 0
+
+        # Dedup state — simple: track last saved timestamp + embedding
+        last_saved_timestamp = -999.0
+        last_saved_embedding = None  # np.ndarray or None
+
+        # Rule 3: Ensure DB unique index exists
+        db_queries.ensure_video_detections_index()
 
         for frame_idx, timestamp_sec in enumerate(extraction_times):
             # Seek to the frame at the given timestamp
@@ -367,37 +412,70 @@ def process_video(video_id: str):
                 new_h = int(h_orig * scale)
                 frame_bgr = cv2.resize(frame_bgr, (new_w, new_h))
 
+            # --- Fast pre-filter: skip frames with no faces ---
+            if not _has_faces_fast(frame_bgr):
+                skipped_no_face += 1
+                processed += 1
+                del frame_bgr
+                if processed % PROGRESS_UPDATE_INTERVAL == 0:
+                    db_queries.update_video_status(
+                        video_id,
+                        status="processing",
+                        processed_frames=processed,
+                        total_detections=detection_count,
+                    )
+                continue
+
             # Convert BGR -> RGB for DeepFace
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
             # Detect faces and get embeddings
             faces = _detect_and_embed(frame_rgb)
 
+            # ---- Rule 1: Only process the BEST face match per frame ----
+            best_frame_match = None  # (distance, confidence, embedding_arr, facial_area)
+
             for embedding, facial_area in faces:
                 embedding_arr = np.array(embedding, dtype=np.float64)
 
-                # Skip if dimension mismatch
                 if len(embedding_arr) != len(target_embedding):
                     continue
 
                 distance = _cosine_distance(target_embedding, embedding_arr)
                 confidence = (1.0 - distance) * 100.0
 
-                logger.info(
-                    f"[VIDEO] Frame {frame_idx} (t={timestamp_sec:.1f}s): "
-                    f"face dist={distance:.4f}, conf={confidence:.1f}%"
-                )
+                if distance <= threshold and confidence >= MIN_CONFIDENCE_PERCENT:
+                    if best_frame_match is None or confidence > best_frame_match[1]:
+                        best_frame_match = (distance, confidence, embedding_arr, facial_area)
+                else:
+                    logger.info(
+                        f"[FILTER] Rejected at {timestamp_sec:.1f}s, "
+                        f"conf={confidence:.1f}%, dist={distance:.4f}"
+                    )
 
-                if distance <= threshold:
-                    # We have a match!
+            # ---- Rule 2: Suppress consecutive similar detections ----
+            if best_frame_match is not None:
+                _, confidence, embedding_arr, facial_area = best_frame_match
+
+                suppressed = False
+                time_gap = timestamp_sec - last_saved_timestamp
+
+                if time_gap < SUPPRESSION_WINDOW_SEC and last_saved_embedding is not None:
+                    face_dist = _cosine_distance(last_saved_embedding, embedding_arr)
+                    if face_dist < SUPPRESSION_SIMILARITY:
+                        logger.info(
+                            f"[DEDUP] Suppressed at {timestamp_sec:.1f}s: "
+                            f"gap={time_gap:.1f}s, face_dist={face_dist:.4f}"
+                        )
+                        suppressed = True
+
+                if not suppressed:
+                    # Save this detection
                     detection_id = str(uuid.uuid4())
-
-                    # Crop and save the face
                     cropped = _crop_face(frame_rgb, facial_area)
                     if cropped is not None and cropped.size > 0:
                         cropped_path = _save_cropped_face(cropped, detection_id)
                     else:
-                        # Save the full frame as fallback
                         cropped_path = _save_cropped_face(frame_rgb, detection_id)
 
                     detection = VideoDetections(
@@ -409,12 +487,15 @@ def process_video(video_id: str):
                         cropped_face_path=cropped_path,
                         frame_number=frame_idx,
                     )
+
                     detections_buffer.append(detection)
                     detection_count += 1
+                    last_saved_timestamp = timestamp_sec
+                    last_saved_embedding = embedding_arr
 
                     logger.info(
-                        f"[VIDEO] DETECTION at {timestamp_sec:.1f}s: "
-                        f"confidence={confidence:.1f}%, distance={distance:.4f}"
+                        f"[VIDEO] SAVED at {timestamp_sec:.1f}s: "
+                        f"conf={confidence:.1f}%, id={detection_id[:8]}"
                     )
 
             # Release frame memory
@@ -433,7 +514,7 @@ def process_video(video_id: str):
                     processed_frames=processed,
                     total_detections=detection_count,
                 )
-                logger.info(f"[VIDEO] Progress: {processed}/{total_frames_to_process} frames, {detection_count} detections")
+                logger.info(f"[VIDEO] Progress: {processed}/{total_frames_to_process} frames, {detection_count} detections, {skipped_no_face} skipped")
 
         # ---- Flush remaining detections ----
         if detections_buffer:
@@ -451,7 +532,8 @@ def process_video(video_id: str):
 
         logger.info(
             f"[VIDEO] ========== COMPLETE: video={video_id}, "
-            f"frames={processed}, detections={detection_count} =========="
+            f"frames={processed}, detections={detection_count}, "
+            f"skipped_no_face={skipped_no_face} =========="
         )
 
     except Exception as e:

@@ -20,7 +20,7 @@ export default function VideoAnalysis() {
     const [selectedCaseId, setSelectedCaseId] = useState('');
     const [videoFile, setVideoFile] = useState<File | null>(null);
     const [videoLocation, setVideoLocation] = useState('');
-    const [confidenceThreshold, setConfidenceThreshold] = useState(0.85);
+    const [confidenceThreshold, setConfidenceThreshold] = useState(0.40);
     const [uploading, setUploading] = useState(false);
     const [uploadError, setUploadError] = useState<string | null>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
@@ -373,16 +373,16 @@ export default function VideoAnalysis() {
                                     <input
                                         id="confidence-threshold"
                                         type="range"
-                                        min="0.5"
-                                        max="1.2"
+                                        min="0.20"
+                                        max="0.40"
                                         step="0.05"
                                         value={confidenceThreshold}
                                         onChange={(e) => setConfidenceThreshold(parseFloat(e.target.value))}
                                         className="w-full mt-2"
                                     />
                                     <div className="flex justify-between text-xs text-gray-400 mt-1">
-                                        <span>Stricter (0.50)</span>
-                                        <span>More results (1.20)</span>
+                                        <span>Stricter (0.20)</span>
+                                        <span>More results (0.40)</span>
                                     </div>
                                 </div>
                             </div>
@@ -579,9 +579,9 @@ export default function VideoAnalysis() {
                                     </div>
                                     <div className="text-center">
                                         <p className="text-4xl font-bold" style={{ color: '#10b981' }}>
-                                            {results.detections.filter(d => d.confidence >= 30).length}
+                                            {results.detections.filter(d => d.confidence >= 60).length}
                                         </p>
-                                        <p className="text-sm text-gray-600 mt-1">Higher Confidence (≥30%)</p>
+                                        <p className="text-sm text-gray-600 mt-1">Higher Confidence (≥60%)</p>
                                     </div>
                                     <div className="text-center">
                                         <p className="text-4xl font-bold" style={{ color: '#f59e0b' }}>
@@ -637,7 +637,7 @@ export default function VideoAnalysis() {
                                                     <div
                                                         className="absolute top-3 right-3 px-3 py-1 rounded-full text-sm font-bold text-white"
                                                         style={{
-                                                            backgroundColor: det.confidence >= 30 ? '#10b981' : det.confidence >= 15 ? '#f59e0b' : '#ef4444',
+                                                            backgroundColor: det.confidence >= 80 ? '#10b981' : det.confidence >= 60 ? '#f59e0b' : '#ef4444',
                                                         }}
                                                     >
                                                         {det.confidence.toFixed(1)}%

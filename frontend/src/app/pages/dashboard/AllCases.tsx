@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
-import { Search, Filter, MapPin, Clock, User, Calendar, Loader2, X } from 'lucide-react';
-import { getCases, deleteCase, type Case } from '@/app/services/api';
+import { Search, Filter, MapPin, Clock, User, Calendar, Loader2, X, CheckCircle } from 'lucide-react';
+import { getCases, deleteCase, markCaseFound, type Case } from '@/app/services/api';
 import { toast } from 'sonner';
 
 const API_BASE = 'http://localhost:8000';
@@ -46,6 +46,25 @@ export default function AllCases() {
     } catch (err) {
       console.error('Failed to delete case:', err);
       toast.error('Failed to delete case');
+    }
+  };
+
+  const handleMarkAsFound = async (caseId: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!window.confirm('Mark this person as found? This will remove them from the active matching pool.')) {
+      return;
+    }
+
+    try {
+      await markCaseFound(caseId);
+      setCases(cases.map(c => c.id === caseId ? { ...c, status: 'F' } : c));
+      if (selectedCase?.id === caseId) {
+        setSelectedCase({ ...selectedCase, status: 'F' });
+      }
+      toast.success('Case marked as found!');
+    } catch (err) {
+      console.error('Failed to mark case as found:', err);
+      toast.error('Failed to mark case as found');
     }
   };
 
@@ -235,13 +254,15 @@ export default function AllCases() {
                   >
                     View Details
                   </button>
-                  <button
-                    onClick={(e) => e.stopPropagation()}
-                    className="px-4 py-2 border-2 rounded-lg font-medium transition-all hover:shadow-md"
-                    style={{ borderColor: '#1e1b4b', color: '#1e1b4b' }}
-                  >
-                    Share
-                  </button>
+                  {caseItem.status === 'NF' && (
+                    <button
+                      onClick={(e) => handleMarkAsFound(caseItem.id, e)}
+                      className="px-4 py-2 border-2 rounded-lg font-medium transition-all hover:shadow-md hover:bg-green-50 text-green-600 border-green-600 flex items-center gap-1"
+                    >
+                      <CheckCircle className="h-4 w-4" />
+                      Found
+                    </button>
+                  )}
                   <button
                     onClick={(e) => handleDelete(caseItem.id, e)}
                     className="px-4 py-2 border-2 rounded-lg font-medium transition-all hover:shadow-md hover:bg-red-50 text-red-600 border-red-600"
@@ -356,13 +377,25 @@ export default function AllCases() {
                     </p>
                   </div>
 
-                  <button
-                    onClick={() => setSelectedCase(null)}
-                    className="w-full mt-2 px-6 py-3 rounded-lg text-white font-medium transition-all hover:shadow-lg"
-                    style={{ backgroundColor: '#1e1b4b' }}
-                  >
-                    Close
-                  </button>
+                  <div className="flex gap-3 mt-2">
+                    {selectedCase.status === 'NF' && (
+                      <button
+                        onClick={(e) => handleMarkAsFound(selectedCase.id, e)}
+                        className="flex-1 px-6 py-3 rounded-lg text-white font-medium transition-all hover:shadow-lg flex items-center justify-center gap-2"
+                        style={{ backgroundColor: '#10b981' }}
+                      >
+                        <CheckCircle className="h-5 w-5" />
+                        Mark as Found
+                      </button>
+                    )}
+                    <button
+                      onClick={() => setSelectedCase(null)}
+                      className="flex-1 px-6 py-3 rounded-lg text-white font-medium transition-all hover:shadow-lg"
+                      style={{ backgroundColor: '#1e1b4b' }}
+                    >
+                      Close
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>

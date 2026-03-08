@@ -154,6 +154,10 @@ export async function deleteCase(caseId: string): Promise<{ status: string; id: 
     return apiRequest(`/cases/${caseId}`, { method: 'DELETE' });
 }
 
+export async function markCaseFound(caseId: string): Promise<{ status: string; id: string; message: string }> {
+    return apiRequest(`/cases/${caseId}/found`, { method: 'PATCH' });
+}
+
 // ============ Public Submissions API ============
 
 export interface PublicSubmission {
@@ -338,6 +342,7 @@ const api = {
     getCase,
     registerCase,
     deleteCase,
+    markCaseFound,
 
     // Public
     getPublicSubmissions,

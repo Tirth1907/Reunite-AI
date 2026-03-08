@@ -19,8 +19,9 @@ except ImportError:
     logger.warning("DeepFace not installed. Matching will fail or return empty.")
 
 # Configurable threshold (lower = stricter matching)
-# DeepFace ArcFace default for Cosine is ~0.68. Using 0.60 for stricter matching.
-DEFAULT_TOLERANCE = 0.60
+# distance <= 0.40 corresponds to confidence >= 60%
+DEFAULT_TOLERANCE = 0.40
+MIN_CONFIDENCE_PERCENT = 60  # Hard floor: never accept below this
 
 
 def calculate_cosine_distance(encoding1, encoding2):
@@ -158,10 +159,16 @@ def match(tolerance: float = DEFAULT_TOLERANCE):
                 continue
         
         if best_match_id and min_distance <= tolerance:
-            logger.info(f"MATCH: Public {pub_id} -> Registered {best_match_id} (Dist: {min_distance:.4f})")
+            confidence = (1.0 - min_distance) * 100
+
+            # Hard floor: reject anything below MIN_CONFIDENCE_PERCENT
+            if confidence < MIN_CONFIDENCE_PERCENT:
+                logger.info(f"REJECTED: Public {pub_id} -> Registered {best_match_id} (Conf: {confidence:.1f}% < {MIN_CONFIDENCE_PERCENT}%)")
+                continue
+
+            logger.info(f"MATCH: Public {pub_id} -> Registered {best_match_id} (Dist: {min_distance:.4f}, Conf: {confidence:.1f}%)")
             
             # Persist match to database
-            confidence = (1.0 - min_distance) * 100
             try:
                 if confidence >= 85:
                     db_queries.update_found_status(best_match_id, pub_id)
@@ -282,15 +289,22 @@ def match_one_against_all(case_id: str, case_type: str = "public", tolerance: fl
 
     # 3. Handle Match
     if best_match_id and min_distance <= tolerance:
+        confidence = (1.0 - min_distance) * 100
+
+        # Hard floor: reject anything below MIN_CONFIDENCE_PERCENT
+        if confidence < MIN_CONFIDENCE_PERCENT:
+            logger.info(f"[VERIFICATION] REJECTED: {case_id} <-> {best_match_id} (Conf: {confidence:.1f}% < {MIN_CONFIDENCE_PERCENT}%)")
+            return {"status": True, "match_found": False}
+
         logger.info(f"--- [VERIFICATION] STEP 3: MATCH FOUND! Persisting... ---")
-        logger.info(f"MATCH: {case_id} <--> {best_match_id} (Dist: {min_distance:.4f})")
+        logger.info(f"MATCH: {case_id} <--> {best_match_id} (Dist: {min_distance:.4f}, Conf: {confidence:.1f}%)")
         
         # Persist match
         reg_id = best_match_id if case_type == "public" else case_id
         pub_id = case_id if case_type == "public" else best_match_id
         
         try:
-            confidence = (1.0 - min_distance) * 100
+            # confidence already computed above
             if confidence >= 85:
                 db_queries.update_found_status(reg_id, pub_id)
                 logger.info(f"[VERIFICATION] AUTO-VERIFIED {reg_id} <-> {pub_id} (Confidence: {confidence:.2f}%)")

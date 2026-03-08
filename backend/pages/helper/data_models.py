@@ -66,7 +66,10 @@ class VideoUploads(SQLModel, table=True):
 
 
 class VideoDetections(SQLModel, table=True):
-    __table_args__ = {"extend_existing": True}
+    __table_args__ = (
+        # Layer 5: DB-level safety net — one detection per timestamp per video
+        {"extend_existing": True},
+    )
 
     id: str = Field(
         primary_key=True, default_factory=lambda: str(uuid4()), nullable=False

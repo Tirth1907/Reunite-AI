@@ -90,7 +90,7 @@ async def upload_video(
     video: UploadFile = File(...),
     case_id: str = Form(...),
     video_location: str = Form(""),
-    confidence_threshold: float = Form(0.60),
+    confidence_threshold: float = Form(0.40),
     background_tasks: BackgroundTasks = None,
 ):
     """
@@ -133,6 +133,9 @@ async def upload_video(
     if not ok:
         os.remove(file_path)
         raise HTTPException(status_code=400, detail=error)
+
+    # Clamp threshold to safe maximum (0.40 distance = 60% confidence floor)
+    confidence_threshold = min(confidence_threshold, 0.40)
 
     # Create database record
     upload_record = VideoUploads(

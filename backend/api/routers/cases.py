@@ -19,6 +19,10 @@ from pages.helper.data_models import RegisteredCases
 
 router = APIRouter()
 
+# Absolute path to resources directory — matches the static mount in main.py
+RESOURCES_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "resources")
+os.makedirs(RESOURCES_DIR, exist_ok=True)
+
 
 class CaseResponse(BaseModel):
     id: str
@@ -173,9 +177,8 @@ async def register_case(
     photo_bytes = await photo.read()
     case_id = str(uuid.uuid4())
     photo_filename = f"{case_id}.jpg"
-    photo_path = os.path.join("resources", photo_filename)
+    photo_path = os.path.join(RESOURCES_DIR, photo_filename)
     
-    os.makedirs("resources", exist_ok=True)
     with open(photo_path, "wb") as f:
         f.write(photo_bytes)
     
@@ -260,13 +263,32 @@ async def get_case(case_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.patch("/{case_id}/found")
+async def mark_case_found(case_id: str):
+    """
+    Manually mark a registered case as Found.
+    Sets status = 'F', removing it from the active matching pool.
+    """
+    try:
+        db_queries.mark_case_as_found(case_id)
+        return {
+            "status": "found",
+            "id": case_id,
+            "message": "Case marked as found successfully.",
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.delete("/{case_id}")
 async def delete_case(case_id: str):
     """Delete a registered case."""
     try:
         db_queries.delete_registered_case(case_id)
         
-        photo_path = os.path.join("resources", f"{case_id}.jpg")
+        photo_path = os.path.join(RESOURCES_DIR, f"{case_id}.jpg")
         if os.path.exists(photo_path):
             os.remove(photo_path)
         

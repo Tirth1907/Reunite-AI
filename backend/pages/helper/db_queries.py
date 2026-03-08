@@ -1,5 +1,8 @@
 
+import logging
 from sqlmodel import create_engine, Session, select
+
+logger = logging.getLogger(__name__)
 
 from pages.helper.data_models import (
     RegisteredCases, PublicSubmissions, VideoUploads, VideoDetections
@@ -351,6 +354,22 @@ def delete_public_case(case_id: str):
             session.commit()
 
 
+def mark_case_as_found(case_id: str):
+    """
+    Manually mark a registered case as Found (status = 'F').
+    Used when a person is found through non-AI means (e.g., tip-off, police).
+    Removes the case from the active matching pool.
+    """
+    with Session(engine) as session:
+        case = session.get(RegisteredCases, case_id)
+        if not case:
+            raise ValueError(f"Case {case_id} not found")
+        case.status = "F"
+        session.add(case)
+        session.commit()
+        return case
+
+
 # ============================================================
 # Phase 2 — Video Analysis Queries
 # ============================================================
@@ -407,13 +426,48 @@ def save_video_detection(detection: VideoDetections):
 
 
 def save_video_detections_batch(detections: list):
-    """Insert multiple video detection records in one transaction."""
+    """Insert multiple video detection records in one transaction.
+    Silently skips duplicates (Layer 5 safety net)."""
     if not detections:
         return
     with Session(engine) as session:
         for det in detections:
-            session.add(det)
-        session.commit()
+            try:
+                session.add(det)
+                session.flush()  # Flush each to catch constraint violations early
+            except Exception:
+                session.rollback()
+                logger.warning(f"[DB] Skipped duplicate detection: {det.id} at t={det.timestamp_seconds}s")
+                continue
+        try:
+            session.commit()
+        except Exception:
+            session.rollback()
+            logger.warning("[DB] Batch commit failed, attempting individual inserts")
+            # Fallback: try inserting one-by-one
+            for det in detections:
+                try:
+                    with Session(engine) as s2:
+                        s2.add(det)
+                        s2.commit()
+                except Exception:
+                    pass
+
+
+def ensure_video_detections_index():
+    """Create a unique index on (video_id, timestamp_seconds) if it doesn't exist.
+    Layer 5: DB-level duplicate prevention."""
+    try:
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "idx_video_ts_unique ON videodetections(video_id, timestamp_seconds)"
+            ))
+            conn.commit()
+        logger.info("[DB] Unique index idx_video_ts_unique ensured on videodetections")
+    except Exception as e:
+        logger.warning(f"[DB] Could not create unique index (may already exist): {e}")
 
 
 def get_video_detections_by_case(case_id: str):
