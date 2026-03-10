@@ -27,6 +27,55 @@ import PIL.Image
 
 from pages.helper import db_queries
 from pages.helper.data_models import VideoDetections
+from pages.helper.fallback_detector import (
+    detect_face_fallback,
+    has_face_loose,
+    upscale_if_small,
+    apply_clahe,
+    get_fallback_frame_interval,
+    FALLBACK_DISTANCE_THRESHOLD,
+    FALLBACK_MIN_CONFIDENCE,
+    FALLBACK_MIN_FACE_SIZE,
+    FALLBACK_MIN_EMBEDDING_NORM
+)
+
+# ============================================================
+# SPEED-CRITICAL FILE — READ BEFORE MODIFYING
+# ============================================================
+# PROTECTED FILES (DO NOT MODIFY):
+#   backend/pages/helper/registration_encoder.py
+#   backend/pages/helper/fallback_detector.py
+#
+# FALLBACK PASS RULES:
+#   All fallback detection logic lives in fallback_detector.py
+#   Do NOT add DeepFace calls directly in the fallback pass here
+#   Do NOT add retry loops in the fallback pass
+#   Do NOT use retinaface in the fallback pass
+#   Do NOT disable has_face_loose() pre-filter
+#
+# PASS 1 RULES:
+#   Pass 1 uses retinaface — do NOT change this
+#   Pass 1 thresholds: distance=0.40, confidence=60%
+#   Do NOT modify Pass 1 when fixing fallback issues
+#
+# After any change to this file, run:
+#   python backend/test_speed.py
+#   python backend/test_registration.py
+# ============================================================
+
+# ============================================================
+# IMPORTANT: THIS FILE HANDLES VIDEO PROCESSING ONLY
+# ============================================================
+# Do NOT add registration logic to this file.
+# Do NOT copy preprocessing patterns from here to cases.py
+# Do NOT modify Pass 1 logic when improving fallback pass.
+#
+# Registration embedding extraction lives in:
+# backend/pages/helper/registration_encoder.py
+#
+# Pass 1 (strict CCTV) and fallback pass are separate code paths.
+# Modifying the fallback pass must never affect Pass 1.
+# ============================================================
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -45,6 +94,8 @@ SUPPRESSION_WINDOW_SEC = 3        # Suppress similar consecutive detections with
 SUPPRESSION_SIMILARITY = 0.10     # Cosine distance below this = same face (skip)
 MIN_CONFIDENCE_PERCENT = 60       # Hard floor: never save detections below this confidence
 MAX_VIDEO_SIZE_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
+
+
 
 # Directories
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -169,7 +220,7 @@ def _cosine_distance(a, b):
     return 1.0 - (np.dot(a, b) / (norm_a * norm_b))
 
 
-def _detect_and_embed(frame_rgb):
+def _detect_and_embed(frame_rgb, is_fallback_pass=False):
     """
     Detect faces in a frame and return list of (embedding, facial_area).
 
@@ -179,29 +230,43 @@ def _detect_and_embed(frame_rgb):
     3. Try both RetinaFace and OpenCV backends
     4. Skip alignment if aligned version fails (handles missing landmarks)
 
+    When is_fallback_pass=True:
+    - enforce_detection=False (don't crash on missing faces)
+    - Face area minimum = 8px (instead of 15px)
+    - Embedding norm minimum = 0.3 (instead of 1.0)
+
     Each facial_area is a dict with keys: x, y, w, h.
     """
     from deepface import DeepFace
 
     faces = []
 
+    # Determine enforcement based on pass type
+    enforce = not is_fallback_pass  # True for Pass 1, False for fallback
+
     # Strategy list: (detector_backend, enforce, align, label)
-    # Only 2 strategies — Haar pre-filter already confirmed a face exists
+    # Only 2 strategies — Haar pre-filter already confirmed a face exists (Pass 1)
     strategies = [
-        ("retinaface", True, True, "retina+enforce+align"),
-        ("opencv", True, True, "opencv+enforce+align"),
+        ("retinaface", enforce, True, "retina+enforce+align"),
+        ("opencv", enforce, True, "opencv+enforce+align"),
     ]
 
-    for detector, enforce, align, label in strategies:
+    # Quality thresholds based on pass type
+    min_face_size = FALLBACK_MIN_FACE_SIZE if is_fallback_pass else 15
+    min_norm = FALLBACK_MIN_EMBEDDING_NORM if is_fallback_pass else 1.0
+
+    for detector, enforce_det, align, label in strategies:
         try:
             results = DeepFace.represent(
                 img_path=frame_rgb,
                 model_name="ArcFace",
                 detector_backend=detector,
-                enforce_detection=enforce,
+                enforce_detection=enforce_det,
                 align=align,
             )
-        except Exception:
+        except Exception as e:
+            if is_fallback_pass:
+                logger.debug(f"[VIDEO] [FALLBACK] DeepFace strategy '{label}' failed: {e}")
             # enforce_detection=True raises when no face found — that's expected
             continue
 
@@ -219,13 +284,19 @@ def _detect_and_embed(frame_rgb):
 
             # Quality check: skip garbage embeddings (near-zero norm)
             norm = np.linalg.norm(emb_arr)
-            if norm < 1.0:
+            if norm <= min_norm:
+                logger.debug(
+                    f"[VIDEO] Embedding norm too low: {norm:.4f} (min={min_norm})"
+                )
                 continue
 
             # Quality check: skip if facial area is too small (likely noise)
             face_w = facial_area.get("w", 0)
             face_h = facial_area.get("h", 0)
-            if face_w > 0 and face_h > 0 and (face_w < 15 or face_h < 15):
+            if face_w > 0 and face_h > 0 and (face_w < min_face_size or face_h < min_face_size):
+                logger.debug(
+                    f"[VIDEO] Face too small: {face_w}x{face_h} (min={min_face_size})"
+                )
                 continue
 
             faces.append((embedding, facial_area))
@@ -300,87 +371,86 @@ def validate_video_file(file_path):
 
 
 # ---------------------------------------------------------------------------
-# Main Processing Pipeline
+# Processing Pass Helper
 # ---------------------------------------------------------------------------
 
-def process_video(video_id: str):
+def get_adaptive_frame_interval(duration_seconds: float, is_fallback_pass: bool = False) -> int:
     """
-    Main entry point for background video processing.
-
-    1. Loads the target case embedding from the database
-    2. Opens the video with OpenCV
-    3. Extracts frames every 2 seconds
-    4. Detects faces and generates embeddings
-    5. Matches against the target case
-    6. Saves detections to the database
+    Returns frame extraction interval in seconds.
+    Fallback pass uses denser sampling for short videos
+    to maximize detection chances.
     """
-    logger.info(f"[VIDEO] ========== Starting processing for video {video_id} ==========")
+    if is_fallback_pass:
+        # Denser sampling in fallback for better detection
+        if duration_seconds <= 90:      return 1   # short: every 1s
+        elif duration_seconds <= 300:   return 2   # 1.5-5 min: every 2s
+        elif duration_seconds <= 600:   return 4   # 5-10 min: every 4s
+        elif duration_seconds <= 900:   return 6   # 10-15 min: every 6s
+        else:                           return 10  # over 15 min: every 10s
+    else:
+        # Pass 1: original adaptive sampling (unchanged)
+        if duration_seconds <= 120:     return 3
+        elif duration_seconds <= 300:   return 5
+        elif duration_seconds <= 600:   return 8
+        elif duration_seconds <= 900:   return 12
+        else:                           return 15
 
-    # ---- Load upload record ----
-    upload = db_queries.get_video_upload(video_id)
-    if not upload:
-        logger.error(f"[VIDEO] Upload record {video_id} not found in database")
-        return
 
-    case_id = upload.case_id
-    file_path = upload.file_path
-    threshold = upload.confidence_threshold
+def _run_processing_pass(
+    video_path: str,
+    case_embedding,
+    video_id: str,
+    case_id: str,
+    confidence_threshold: float,
+    min_confidence_percent: int,
+    is_fallback_pass: bool = False,
+):
+    """
+    Run a single processing pass over the video.
 
-    # Clamp: never allow distance threshold above MATCH_DISTANCE_THRESHOLD
-    if threshold > DEFAULT_CONFIDENCE_THRESHOLD:
-        logger.warning(
-            f"[VIDEO] Clamping user threshold {threshold} -> {DEFAULT_CONFIDENCE_THRESHOLD}"
-        )
-        threshold = DEFAULT_CONFIDENCE_THRESHOLD
+    Extracts frames, detects faces, generates embeddings, compares against
+    the target embedding, and saves matched detections.
 
-    # ---- Update status to processing ----
-    db_queries.update_video_status(video_id, status="processing")
+    When is_fallback_pass=True, every saved detection is tagged with
+    is_low_confidence=True.
 
-    cap = None
+    Returns the number of detections saved during this pass.
+    """
+    pass_label = "PASS-2-FALLBACK" if is_fallback_pass else "PASS-1-STRICT"
+    logger.info(
+        f"[VIDEO] [{pass_label}] Starting pass: threshold={confidence_threshold}, "
+        f"min_conf={min_confidence_percent}%, fallback={is_fallback_pass}"
+    )
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video file: {video_path}")
+
     try:
-        # ---- Load target case embedding ----
-        face_mesh_json = db_queries.get_case_embedding(case_id)
-        if not face_mesh_json:
-            raise ValueError(f"Case {case_id} has no face embedding in the database")
-
-        target_embedding = json.loads(face_mesh_json)
-        if not target_embedding or len(target_embedding) == 0:
-            raise ValueError(f"Case {case_id} has an empty/invalid face embedding")
-
-        target_embedding = np.array(target_embedding, dtype=np.float64)
-        logger.info(f"[VIDEO] Target embedding loaded: case={case_id}, dim={len(target_embedding)}")
-
-        # ---- Ensure DeepFace is ready ----
-        if not _ensure_deepface():
-            raise RuntimeError("DeepFace is not available. Install with: pip install deepface")
-
-        # ---- Open video ----
-        cap = cv2.VideoCapture(file_path)
-        if not cap.isOpened():
-            raise RuntimeError(f"Cannot open video file: {file_path}")
-
         fps = cap.get(cv2.CAP_PROP_FPS)
         total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         duration_sec = total_video_frames / fps if fps > 0 else 0
 
-        # Calculate how many frames we'll extract (one every FRAME_INTERVAL_SECONDS)
+        # Calculate how many frames we'll extract (adaptive)
+        interval_seconds = get_fallback_frame_interval(duration_sec) if is_fallback_pass else get_adaptive_frame_interval(duration_sec, is_fallback_pass)
         extraction_times = []
         t = 0.0
         while t < duration_sec:
             extraction_times.append(t)
-            t += FRAME_INTERVAL_SECONDS
+            t += interval_seconds
 
         total_frames_to_process = len(extraction_times)
 
         logger.info(
-            f"[VIDEO] Video info: fps={fps:.1f}, total_frames={total_video_frames}, "
+            f"[VIDEO] [{pass_label}] Video info: fps={fps:.1f}, total_frames={total_video_frames}, "
             f"duration={duration_sec:.1f}s, frames_to_extract={total_frames_to_process}"
         )
 
-        # Update total frames in DB
-        db_queries.update_video_status(
-            video_id, status="processing", total_frames=total_frames_to_process
-        )
+        # Update total frames in DB (only on first pass)
+        if not is_fallback_pass:
+            db_queries.update_video_status(
+                video_id, status="processing", total_frames=total_frames_to_process
+            )
 
         # ---- Frame-by-frame processing ----
         detections_buffer = []
@@ -413,24 +483,49 @@ def process_video(video_id: str):
                 frame_bgr = cv2.resize(frame_bgr, (new_w, new_h))
 
             # --- Fast pre-filter: skip frames with no faces ---
-            if not _has_faces_fast(frame_bgr):
-                skipped_no_face += 1
-                processed += 1
-                del frame_bgr
-                if processed % PROGRESS_UPDATE_INTERVAL == 0:
-                    db_queries.update_video_status(
-                        video_id,
-                        status="processing",
-                        processed_frames=processed,
-                        total_detections=detection_count,
-                    )
-                continue
+            if is_fallback_pass:
+                if not has_face_loose(frame_bgr):
+                    skipped_no_face += 1
+                    processed += 1
+                    del frame_bgr
+                    if processed % PROGRESS_UPDATE_INTERVAL == 0:
+                        db_queries.update_video_status(
+                            video_id,
+                            status="processing",
+                            processed_frames=processed,
+                            total_detections=detection_count,
+                        )
+                    continue
+            else:
+                if not _has_faces_fast(frame_bgr):
+                    skipped_no_face += 1
+                    processed += 1
+                    del frame_bgr
+                    if processed % PROGRESS_UPDATE_INTERVAL == 0:
+                        db_queries.update_video_status(
+                            video_id,
+                            status="processing",
+                            processed_frames=processed,
+                            total_detections=detection_count,
+                        )
+                    continue
 
             # Convert BGR -> RGB for DeepFace
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
+            # Apply preprocessing in fallback pass only (enhance contrast for low-light frames)
+            if is_fallback_pass:
+                frame_rgb = apply_clahe(frame_rgb)
+
             # Detect faces and get embeddings
-            faces = _detect_and_embed(frame_rgb)
+            if is_fallback_pass:
+                fallback_results = detect_face_fallback(frame_rgb)
+                faces = []
+                for res in fallback_results:
+                    if "embedding" in res and "facial_area" in res:
+                        faces.append((res["embedding"], res["facial_area"]))
+            else:
+                faces = _detect_and_embed(frame_rgb, is_fallback_pass=False)
 
             # ---- Rule 1: Only process the BEST face match per frame ----
             best_frame_match = None  # (distance, confidence, embedding_arr, facial_area)
@@ -438,18 +533,18 @@ def process_video(video_id: str):
             for embedding, facial_area in faces:
                 embedding_arr = np.array(embedding, dtype=np.float64)
 
-                if len(embedding_arr) != len(target_embedding):
+                if len(embedding_arr) != len(case_embedding):
                     continue
 
-                distance = _cosine_distance(target_embedding, embedding_arr)
+                distance = _cosine_distance(case_embedding, embedding_arr)
                 confidence = (1.0 - distance) * 100.0
 
-                if distance <= threshold and confidence >= MIN_CONFIDENCE_PERCENT:
+                if distance <= confidence_threshold and confidence >= min_confidence_percent:
                     if best_frame_match is None or confidence > best_frame_match[1]:
                         best_frame_match = (distance, confidence, embedding_arr, facial_area)
                 else:
                     logger.info(
-                        f"[FILTER] Rejected at {timestamp_sec:.1f}s, "
+                        f"[FILTER] [{pass_label}] Rejected at {timestamp_sec:.1f}s, "
                         f"conf={confidence:.1f}%, dist={distance:.4f}"
                     )
 
@@ -464,7 +559,7 @@ def process_video(video_id: str):
                     face_dist = _cosine_distance(last_saved_embedding, embedding_arr)
                     if face_dist < SUPPRESSION_SIMILARITY:
                         logger.info(
-                            f"[DEDUP] Suppressed at {timestamp_sec:.1f}s: "
+                            f"[DEDUP] [{pass_label}] Suppressed at {timestamp_sec:.1f}s: "
                             f"gap={time_gap:.1f}s, face_dist={face_dist:.4f}"
                         )
                         suppressed = True
@@ -486,6 +581,7 @@ def process_video(video_id: str):
                         confidence=round(confidence, 2),
                         cropped_face_path=cropped_path,
                         frame_number=frame_idx,
+                        is_low_confidence=is_fallback_pass,
                     )
 
                     detections_buffer.append(detection)
@@ -494,7 +590,7 @@ def process_video(video_id: str):
                     last_saved_embedding = embedding_arr
 
                     logger.info(
-                        f"[VIDEO] SAVED at {timestamp_sec:.1f}s: "
+                        f"[VIDEO] [{pass_label}] SAVED at {timestamp_sec:.1f}s: "
                         f"conf={confidence:.1f}%, id={detection_id[:8]}"
                     )
 
@@ -514,26 +610,142 @@ def process_video(video_id: str):
                     processed_frames=processed,
                     total_detections=detection_count,
                 )
-                logger.info(f"[VIDEO] Progress: {processed}/{total_frames_to_process} frames, {detection_count} detections, {skipped_no_face} skipped")
+                logger.info(
+                    f"[VIDEO] [{pass_label}] Progress: {processed}/{total_frames_to_process} frames, "
+                    f"{detection_count} detections, {skipped_no_face} skipped"
+                )
 
         # ---- Flush remaining detections ----
         if detections_buffer:
             db_queries.save_video_detections_batch(detections_buffer)
             detections_buffer = []
 
+        logger.info(
+            f"[VIDEO] [{pass_label}] COMPLETE: frames={processed}, "
+            f"detections={detection_count}, skipped_no_face={skipped_no_face}"
+        )
+
+        return detection_count
+
+    finally:
+        cap.release()
+
+
+# ---------------------------------------------------------------------------
+# Main Processing Pipeline (Two-Pass)
+# ---------------------------------------------------------------------------
+
+def process_video(video_id: str):
+    """
+    Main entry point for background video processing.
+
+    Two-pass system:
+      Pass 1 — Strict thresholds (existing logic, unchanged)
+      Pass 2 — Fallback with relaxed thresholds (only if Pass 1 finds 0 detections)
+
+    1. Loads the target case embedding from the database
+    2. Runs Pass 1 with strict thresholds
+    3. If Pass 1 finds 0 detections, runs Pass 2 with fallback thresholds
+    4. Saves detections to the database
+    """
+    logger.info(f"[VIDEO] ========== Starting processing for video {video_id} ==========")
+
+    # ---- Load upload record ----
+    upload = db_queries.get_video_upload(video_id)
+    if not upload:
+        logger.error(f"[VIDEO] Upload record {video_id} not found in database")
+        return
+
+    case_id = upload.case_id
+    file_path = upload.file_path
+    threshold = upload.confidence_threshold
+
+    # Clamp: never allow distance threshold above DEFAULT_CONFIDENCE_THRESHOLD
+    if threshold > DEFAULT_CONFIDENCE_THRESHOLD:
+        logger.warning(
+            f"[VIDEO] Clamping user threshold {threshold} -> {DEFAULT_CONFIDENCE_THRESHOLD}"
+        )
+        threshold = DEFAULT_CONFIDENCE_THRESHOLD
+
+    # ---- Update status to processing ----
+    db_queries.update_video_status(video_id, status="processing")
+
+    try:
+        # ---- Load target case embedding ----
+        face_mesh_json = db_queries.get_case_embedding(case_id)
+        if not face_mesh_json:
+            raise ValueError(f"Case {case_id} has no face embedding in the database")
+
+        target_embedding = json.loads(face_mesh_json)
+        if not target_embedding or len(target_embedding) == 0:
+            raise ValueError(f"Case {case_id} has an empty/invalid face embedding")
+
+        target_embedding = np.array(target_embedding, dtype=np.float64)
+        logger.info(f"[VIDEO] Target embedding loaded: case={case_id}, dim={len(target_embedding)}")
+
+        # ---- Ensure DeepFace is ready ----
+        if not _ensure_deepface():
+            raise RuntimeError("DeepFace is not available. Install with: pip install deepface")
+
+        # ==================================================================
+        # PASS 1 — Strict thresholds (existing logic, completely unchanged)
+        # ==================================================================
+        pass1_count = _run_processing_pass(
+            video_path=file_path,
+            case_embedding=target_embedding,
+            video_id=video_id,
+            case_id=case_id,
+            confidence_threshold=threshold,
+            min_confidence_percent=MIN_CONFIDENCE_PERCENT,
+            is_fallback_pass=False,
+        )
+
+        # Check how many detections Pass 1 actually saved
+        db_detection_count = db_queries.get_detection_count_for_video(video_id)
+
+        if db_detection_count == 0:
+            # ==============================================================
+            # PASS 2 — Fallback with relaxed thresholds
+            # ==============================================================
+            logger.info(
+                f"[VIDEO] Pass 1 found 0 detections. Triggering fallback Pass 2 "
+                f"(threshold={FALLBACK_DISTANCE_THRESHOLD}, "
+                f"min_conf={FALLBACK_MIN_CONFIDENCE}%)"
+            )
+
+            pass2_count = _run_processing_pass(
+                video_path=file_path,
+                case_embedding=target_embedding,
+                video_id=video_id,
+                case_id=case_id,
+                confidence_threshold=FALLBACK_DISTANCE_THRESHOLD,
+                min_confidence_percent=FALLBACK_MIN_CONFIDENCE,
+                is_fallback_pass=True,
+            )
+
+            # Mark that fallback was used on the upload record
+            db_queries.update_video_fallback(video_id, used_fallback=True)
+
+            total_detections = pass2_count
+            logger.info(f"[VIDEO] Pass 2 completed with {pass2_count} detections.")
+        else:
+            total_detections = db_detection_count
+            logger.info(
+                f"[VIDEO] Pass 1 found {db_detection_count} detections. "
+                f"Fallback not needed."
+            )
+
         # ---- Mark as complete ----
         db_queries.update_video_status(
             video_id,
             status="done",
-            processed_frames=processed,
-            total_detections=detection_count,
+            total_detections=total_detections,
             completed_at=datetime.utcnow(),
         )
 
         logger.info(
             f"[VIDEO] ========== COMPLETE: video={video_id}, "
-            f"frames={processed}, detections={detection_count}, "
-            f"skipped_no_face={skipped_no_face} =========="
+            f"total_detections={total_detections} =========="
         )
 
     except Exception as e:
@@ -547,6 +759,4 @@ def process_video(video_id: str):
         )
 
     finally:
-        if cap is not None:
-            cap.release()
         logger.info(f"[VIDEO] Resources released for video {video_id}")

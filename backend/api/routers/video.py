@@ -56,6 +56,7 @@ class DetectionItem(BaseModel):
     timestamp_display: str
     confidence: float
     cropped_face_url: str
+    is_low_confidence: bool = False
     detected_at: Optional[datetime] = None
 
 
@@ -63,6 +64,7 @@ class VideoResultsResponse(BaseModel):
     case_id: str
     case_name: Optional[str] = None
     total_videos_analyzed: int = 0
+    used_fallback: bool = False
     detections: List[DetectionItem] = []
 
 
@@ -221,12 +223,19 @@ async def get_video_results(case_id: str):
             timestamp_display=_format_timestamp(det.timestamp_seconds),
             confidence=det.confidence,
             cropped_face_url=f"/resources/{det.cropped_face_path}",
+            is_low_confidence=getattr(det, 'is_low_confidence', False),
             detected_at=det.detected_at,
         ))
+
+    # Check if any upload used fallback
+    any_used_fallback = any(
+        getattr(u, 'used_fallback', False) for u in (uploads or [])
+    )
 
     return VideoResultsResponse(
         case_id=case_id,
         case_name=case_name,
         total_videos_analyzed=len(upload_map),
+        used_fallback=any_used_fallback,
         detections=detection_items,
     )

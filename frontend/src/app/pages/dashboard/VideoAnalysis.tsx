@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import {
     Video, Upload, Search, Clock, MapPin, CheckCircle, AlertCircle,
-    Loader2, ChevronRight, Camera, Shield, X
+    Loader2, ChevronRight, Camera, Shield, X, AlertTriangle
 } from 'lucide-react';
 import {
     getCases, uploadVideo, getVideoStatus, getVideoResults,
@@ -34,6 +34,7 @@ export default function VideoAnalysis() {
     // Results phase
     const [results, setResults] = useState<VideoResults | null>(null);
     const [loadingResults, setLoadingResults] = useState(false);
+    const [showFallbackBanner, setShowFallbackBanner] = useState(true);
 
     // ---- Load cases on mount ----
     useEffect(() => {
@@ -568,6 +569,27 @@ export default function VideoAnalysis() {
                         </div>
                     ) : results ? (
                         <>
+                            {/* Fallback warning banner */}
+                            {results.used_fallback && showFallbackBanner && (
+                                <div
+                                    className="flex items-center justify-between p-4 rounded-xl border"
+                                    style={{ backgroundColor: '#fef3c7', borderColor: '#f59e0b' }}
+                                >
+                                    <div className="flex items-center gap-3">
+                                        <AlertTriangle className="h-5 w-5 flex-shrink-0" style={{ color: '#d97706' }} />
+                                        <p className="text-sm font-medium" style={{ color: '#92400e' }}>
+                                            ⚠️ No high-confidence matches found. Showing low-confidence detections for review.
+                                        </p>
+                                    </div>
+                                    <button
+                                        onClick={() => setShowFallbackBanner(false)}
+                                        className="p-1 rounded-lg hover:bg-yellow-200 transition-colors"
+                                        aria-label="Dismiss fallback banner"
+                                    >
+                                        <X className="h-4 w-4" style={{ color: '#92400e' }} />
+                                    </button>
+                                </div>
+                            )}
                             {/* Summary card */}
                             <div className="bg-white rounded-xl p-6 shadow-md border border-gray-200">
                                 <div className="grid sm:grid-cols-3 gap-6">
@@ -625,7 +647,7 @@ export default function VideoAnalysis() {
                                                 {/* Cropped face image */}
                                                 <div className="relative">
                                                     <img
-                                                        src={`http://localhost:8000${det.cropped_face_url}`}
+                                                        src={`http://127.0.0.1:8000${det.cropped_face_url}`}
                                                         alt={`Detection ${idx + 1}`}
                                                         className="w-full h-48 object-cover bg-gray-100"
                                                         onError={(e) => {
@@ -637,11 +659,26 @@ export default function VideoAnalysis() {
                                                     <div
                                                         className="absolute top-3 right-3 px-3 py-1 rounded-full text-sm font-bold text-white"
                                                         style={{
-                                                            backgroundColor: det.confidence >= 80 ? '#10b981' : det.confidence >= 60 ? '#f59e0b' : '#ef4444',
+                                                            backgroundColor: det.is_low_confidence
+                                                                ? '#f59e0b'
+                                                                : det.confidence >= 80
+                                                                    ? '#10b981'
+                                                                    : det.confidence >= 60
+                                                                        ? '#f59e0b'
+                                                                        : '#ef4444',
                                                         }}
                                                     >
                                                         {det.confidence.toFixed(1)}%
                                                     </div>
+                                                    {/* Low confidence label */}
+                                                    {det.is_low_confidence && (
+                                                        <div
+                                                            className="absolute bottom-3 left-3 right-3 px-2 py-1 rounded-lg text-xs font-bold text-center"
+                                                            style={{ backgroundColor: '#fef3c7', color: '#92400e' }}
+                                                        >
+                                                            Low Confidence — Needs Review
+                                                        </div>
+                                                    )}
                                                     <div className="absolute top-3 left-3 px-2 py-1 rounded-lg bg-black/60 text-white text-xs font-mono">
                                                         #{idx + 1}
                                                     </div>

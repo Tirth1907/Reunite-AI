@@ -6,16 +6,32 @@ import os
 import uuid
 import json
 from datetime import datetime
-from io import BytesIO
 from typing import List, Optional
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, BackgroundTasks
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 import numpy as np
-import PIL.Image
+import cv2
 
 from pages.helper import db_queries
 from pages.helper.data_models import RegisteredCases
+from pages.helper.registration_encoder import extract_registration_embedding
+
+# ============================================================
+# IMPORTANT: REGISTRATION FACE EXTRACTION IS PROTECTED
+# ============================================================
+# The extract_face_encoding_from_image() function in this file
+# delegates to backend/pages/helper/registration_encoder.py
+#
+# DO NOT add preprocessing to extract_face_encoding_from_image()
+# DO NOT add CLAHE, border detection, or cv2 transforms here
+# DO NOT change the logic — it must stay as a simple delegation
+#
+# If you need to modify registration embedding behavior:
+# 1. Read registration_encoder.py header comments first
+# 2. Only modify registration_encoder.py
+# 3. Run: python backend/test_registration.py to verify
+# ============================================================
 
 router = APIRouter()
 
@@ -43,34 +59,9 @@ class CaseResponse(BaseModel):
         from_attributes = True
 
 
-def extract_face_encoding_from_image(image_bytes: bytes) -> Optional[list]:
-    """Extract face encoding from image bytes using DeepFace."""
-    try:
-        from deepface import DeepFace
-        
-        image = PIL.Image.open(BytesIO(image_bytes)).convert("RGB")
-        image_array = np.array(image)
-        
-        embedding_objs = DeepFace.represent(
-            img_path=image_array,
-            model_name="ArcFace",
-            detector_backend="retinaface",
-            enforce_detection=True,
-            align=True
-        )
-        
-        if embedding_objs:
-            return embedding_objs[0]["embedding"]
-        
-        print("No face detected in image (DeepFace)")
-        return None
-        
-    except ImportError:
-        print("DeepFace not installed or model missing")
-        return None
-    except Exception as e:
-        print(f"Error extracting face encoding: {e}")
-        return None
+# DO NOT MODIFY — delegates to registration_encoder.py
+def extract_face_encoding_from_image(image_bytes: bytes) -> list:
+    return extract_registration_embedding(image_bytes)
 
 
 @router.get("", response_model=List[CaseResponse])
@@ -183,15 +174,15 @@ async def register_case(
         f.write(photo_bytes)
     
     # Extract face encoding in thread pool to avoid blocking
-    face_encoding = await run_in_threadpool(extract_face_encoding_from_image, photo_bytes)
-    
-    if not face_encoding:
+    try:
+        face_encoding = await run_in_threadpool(extract_face_encoding_from_image, photo_bytes)
+    except ValueError as e:
         # cleanup saved photo
         if os.path.exists(photo_path):
             os.remove(photo_path)
         raise HTTPException(
             status_code=400, 
-            detail="No face detected in the image. Please upload a clear photo of the person's face."
+            detail=str(e)
         )
     
     # Create case record

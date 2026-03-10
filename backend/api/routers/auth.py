@@ -63,7 +63,7 @@ def verify_yaml_credentials(username: str, password: str) -> Optional[dict]:
         users = config.get("credentials", {}).get("usernames", {})
         if username in users:
             user_data = users[username]
-            # Note: In the YAML, passwords are hashed with streamlit_authenticator
+            # Note: In the YAML, passwords were historically hashed
             # For now, we'll do a simple comparison (should be updated for production)
             stored_password = user_data.get("password", "")
             
@@ -92,7 +92,7 @@ async def login(request: LoginRequest):
     Authenticate user and return JWT token.
     
     Currently supports:
-    - YAML-based users from login_config.yml (legacy Streamlit users)
+    - YAML-based users from login_config.yml
     - Demo login for development
     """
     # Try YAML-based authentication first

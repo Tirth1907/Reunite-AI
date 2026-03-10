@@ -61,6 +61,7 @@ class VideoUploads(SQLModel, table=True):
     error_message: Optional[str] = Field(default=None, max_length=512, nullable=True)
     video_location: Optional[str] = Field(default=None, max_length=256, nullable=True)
     confidence_threshold: float = Field(default=0.60, nullable=False)
+    used_fallback: bool = Field(default=False, nullable=False)
     uploaded_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
     completed_at: Optional[datetime] = Field(default=None, nullable=True)
 
@@ -80,6 +81,7 @@ class VideoDetections(SQLModel, table=True):
     confidence: float = Field(nullable=False)
     cropped_face_path: str = Field(max_length=512, nullable=False)
     frame_number: int = Field(nullable=False)
+    is_low_confidence: bool = Field(default=False, nullable=False)
     detected_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
 
 

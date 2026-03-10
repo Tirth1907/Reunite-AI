@@ -492,6 +492,27 @@ def get_video_uploads_by_case(case_id: str):
         return results
 
 
+def get_detection_count_for_video(video_id: str) -> int:
+    """Return the number of detections saved for a specific video."""
+    with Session(engine) as session:
+        from sqlalchemy import func
+        count = session.exec(
+            select(func.count()).where(VideoDetections.video_id == video_id)
+        ).one()
+        return count
+
+
+def update_video_fallback(video_id: str, used_fallback: bool = True):
+    """Set the used_fallback flag on a VideoUploads record."""
+    with Session(engine) as session:
+        upload = session.get(VideoUploads, video_id)
+        if upload:
+            upload.used_fallback = used_fallback
+            session.add(upload)
+            session.commit()
+            logger.info(f"[DB] Set used_fallback={used_fallback} for video {video_id}")
+
+
 def get_case_embedding(case_id: str):
     """Fetch the face_mesh embedding for a registered case."""
     with Session(engine) as session:
@@ -500,3 +521,28 @@ def get_case_embedding(case_id: str):
             .where(RegisteredCases.id == case_id)
         ).first()
         return result
+
+
+def get_case_photo_path(case_id: str) -> str | None:
+    """
+    Get the absolute file path of the registered photo for a case.
+
+    Photos are stored at resources/{case_id}.jpg by convention
+    (no photo_path column exists in the model).
+    Returns None if the case doesn't exist in DB or the photo file is missing.
+    """
+    import os
+
+    # First verify the case exists
+    with Session(engine) as session:
+        case = session.get(RegisteredCases, case_id)
+        if not case:
+            return None
+
+    # Construct path using same convention as cases.py router
+    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    photo_path = os.path.join(base_dir, "resources", f"{case_id}.jpg")
+
+    if os.path.exists(photo_path):
+        return photo_path
+    return None

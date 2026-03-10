@@ -3,7 +3,7 @@
  * Centralized API client for communicating with the FastAPI backend
  */
 
-const API_BASE = 'http://localhost:8000/api/v1';
+const API_BASE = 'http://127.0.0.1:8000/api/v1';
 
 // Helper function for making API requests
 async function apiRequest<T>(
@@ -235,7 +235,7 @@ export async function getRecentMatches(): Promise<Case[]> {
 
 // ============ Video Analysis API (Phase 2) ============
 
-const API_BASE_V2 = 'http://localhost:8000/api/v2';
+const API_BASE_V2 = 'http://127.0.0.1:8000/api/v2';
 
 export interface VideoUploadResponse {
     video_id: string;
@@ -262,6 +262,7 @@ export interface Detection {
     timestamp_display: string;
     confidence: number;
     cropped_face_url: string;
+    is_low_confidence: boolean;
     detected_at: string | null;
 }
 
@@ -269,6 +270,7 @@ export interface VideoResults {
     case_id: string;
     case_name: string | null;
     total_videos_analyzed: number;
+    used_fallback: boolean;
     detections: Detection[];
 }
 
