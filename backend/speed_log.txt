@@ -1,0 +1,16 @@
+==================================================
+REUNITE AI — SPEED SELF-TEST
+==================================================
+[Test 1] Checking fallback_detector.py imports...
+  FAIL: No module named 'cv2' ✗
+[Test 2] Checking fallback frame intervals...
+  FAIL: No module named 'cv2' ✗
+[Test 3] Testing per-frame processing speed...
+  ERROR: No module named 'cv2'
+[Test 4] Checking for retry loops in fallback_detector.py...
+  PASS: No retry loops found ✓
+
+==================================================
+RESULT: SPEED TESTS FAILED ✗
+Processing will be slow — fix before deploying.
+==================================================

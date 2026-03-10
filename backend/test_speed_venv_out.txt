@@ -1,0 +1,31 @@
+2026-03-10 21:08:45.457833: I tensorflow/core/util/port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+2026-03-10 21:08:47.575984: I tensorflow/core/util/port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+WARNING:tensorflow:From C:\Users\tirth\OneDrive\Desktop\Reunite AI 2.0\.venv\Lib\site-packages\tf_keras\src\losses.py:2976: The name tf.losses.sparse_softmax_cross_entropy is deprecated. Please use tf.compat.v1.losses.sparse_softmax_cross_entropy instead.
+
+==================================================
+REUNITE AI — SPEED SELF-TEST
+==================================================
+[Test 1] Checking fallback_detector.py imports...
+Traceback (most recent call last):
+  File "C:\Users\tirth\OneDrive\Desktop\Reunite AI 2.0\backend\test_speed.py", line 28, in test_fallback_detector_import
+    print(f"  PASS: Backend = {FALLBACK_DETECTOR_BACKEND} \u2713")
+  File "C:\Users\tirth\AppData\Local\Programs\Python\Python312\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2713' in position 25: character maps to <undefined>
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\tirth\OneDrive\Desktop\Reunite AI 2.0\backend\test_speed.py", line 116, in <module>
+    success = run_all_tests()
+              ^^^^^^^^^^^^^^^
+  File "C:\Users\tirth\OneDrive\Desktop\Reunite AI 2.0\backend\test_speed.py", line 100, in run_all_tests
+    test_fallback_detector_import(),
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\tirth\OneDrive\Desktop\Reunite AI 2.0\backend\test_speed.py", line 31, in test_fallback_detector_import
+    print(f"  FAIL: {e} \u2717")
+  File "C:\Users\tirth\AppData\Local\Programs\Python\Python312\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2717' in position 102: character maps to <undefined>

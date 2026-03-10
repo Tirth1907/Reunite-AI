@@ -30,13 +30,13 @@ from pages.helper.data_models import VideoDetections
 from pages.helper.fallback_detector import (
     detect_face_fallback,
     has_face_loose,
+    get_fallback_frame_interval,
     upscale_if_small,
     apply_clahe,
-    get_fallback_frame_interval,
     FALLBACK_DISTANCE_THRESHOLD,
     FALLBACK_MIN_CONFIDENCE,
     FALLBACK_MIN_FACE_SIZE,
-    FALLBACK_MIN_EMBEDDING_NORM
+    FALLBACK_MIN_EMBEDDING_NORM,
 )
 
 # ============================================================
@@ -429,13 +429,17 @@ def _run_processing_pass(
     try:
         fps = cap.get(cv2.CAP_PROP_FPS)
         total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        duration_sec = total_video_frames / fps if fps > 0 else 0
+        video_duration_seconds = total_video_frames / fps if fps > 0 else 0
 
         # Calculate how many frames we'll extract (adaptive)
-        interval_seconds = get_fallback_frame_interval(duration_sec) if is_fallback_pass else get_adaptive_frame_interval(duration_sec, is_fallback_pass)
+        if is_fallback_pass:
+            interval_seconds = get_fallback_frame_interval(video_duration_seconds)
+        else:
+            interval_seconds = get_adaptive_frame_interval(video_duration_seconds)
+
         extraction_times = []
         t = 0.0
-        while t < duration_sec:
+        while t < video_duration_seconds:
             extraction_times.append(t)
             t += interval_seconds
 
@@ -443,7 +447,7 @@ def _run_processing_pass(
 
         logger.info(
             f"[VIDEO] [{pass_label}] Video info: fps={fps:.1f}, total_frames={total_video_frames}, "
-            f"duration={duration_sec:.1f}s, frames_to_extract={total_frames_to_process}"
+            f"duration={video_duration_seconds:.1f}s, frames_to_extract={total_frames_to_process}"
         )
 
         # Update total frames in DB (only on first pass)
@@ -519,11 +523,20 @@ def _run_processing_pass(
 
             # Detect faces and get embeddings
             if is_fallback_pass:
-                fallback_results = detect_face_fallback(frame_rgb)
+                frame_rgb = apply_clahe(frame_rgb)
+                results = detect_face_fallback(frame_rgb)
                 faces = []
-                for res in fallback_results:
-                    if "embedding" in res and "facial_area" in res:
-                        faces.append((res["embedding"], res["facial_area"]))
+                for res in results:
+                    embedding = res.get("embedding")
+                    facial_area = res.get("facial_area", {})
+                    if not embedding: continue
+                    face_w = facial_area.get("w", 0)
+                    face_h = facial_area.get("h", 0)
+                    if face_w < FALLBACK_MIN_FACE_SIZE or face_h < FALLBACK_MIN_FACE_SIZE:
+                        continue
+                    if np.linalg.norm(embedding) <= FALLBACK_MIN_EMBEDDING_NORM:
+                        continue
+                    faces.append((embedding, facial_area))
             else:
                 faces = _detect_and_embed(frame_rgb, is_fallback_pass=False)
 
@@ -539,14 +552,25 @@ def _run_processing_pass(
                 distance = _cosine_distance(case_embedding, embedding_arr)
                 confidence = (1.0 - distance) * 100.0
 
-                if distance <= confidence_threshold and confidence >= min_confidence_percent:
-                    if best_frame_match is None or confidence > best_frame_match[1]:
-                        best_frame_match = (distance, confidence, embedding_arr, facial_area)
+                if is_fallback_pass:
+                    if (distance <= FALLBACK_DISTANCE_THRESHOLD and
+                            confidence >= FALLBACK_MIN_CONFIDENCE):
+                        if best_frame_match is None or confidence > best_frame_match[1]:
+                            best_frame_match = (distance, confidence, embedding_arr, facial_area)
+                    else:
+                        logger.info(
+                            f"[FILTER] [{pass_label}] Rejected at {timestamp_sec:.1f}s, "
+                            f"conf={confidence:.1f}%, dist={distance:.4f}"
+                        )
                 else:
-                    logger.info(
-                        f"[FILTER] [{pass_label}] Rejected at {timestamp_sec:.1f}s, "
-                        f"conf={confidence:.1f}%, dist={distance:.4f}"
-                    )
+                    if distance <= confidence_threshold and confidence >= min_confidence_percent:
+                        if best_frame_match is None or confidence > best_frame_match[1]:
+                            best_frame_match = (distance, confidence, embedding_arr, facial_area)
+                    else:
+                        logger.info(
+                            f"[FILTER] [{pass_label}] Rejected at {timestamp_sec:.1f}s, "
+                            f"conf={confidence:.1f}%, dist={distance:.4f}"
+                        )
 
             # ---- Rule 2: Suppress consecutive similar detections ----
             if best_frame_match is not None:

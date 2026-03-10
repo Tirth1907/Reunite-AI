@@ -1,0 +1,28 @@
+==================================================
+REUNITE AI — SPEED SELF-TEST
+==================================================
+[Test 1] Checking fallback_detector.py imports...
+Traceback (most recent call last):
+  File "C:\Users\tirth\OneDrive\Desktop\Reunite AI 2.0\backend\test_speed.py", line 19, in test_fallback_detector_import
+    from pages.helper.fallback_detector import (
+    ...<3 lines>...
+    )
+  File "C:\Users\tirth\OneDrive\Desktop\Reunite AI 2.0\backend\pages\helper\fallback_detector.py", line 28, in <module>
+    import cv2
+ModuleNotFoundError: No module named 'cv2'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\tirth\OneDrive\Desktop\Reunite AI 2.0\backend\test_speed.py", line 116, in <module>
+    success = run_all_tests()
+  File "C:\Users\tirth\OneDrive\Desktop\Reunite AI 2.0\backend\test_speed.py", line 100, in run_all_tests
+    test_fallback_detector_import(),
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\tirth\OneDrive\Desktop\Reunite AI 2.0\backend\test_speed.py", line 31, in test_fallback_detector_import
+    print(f"  FAIL: {e} \u2717")
+    ~~~~~^^^^^^^^^^^^^^^^^^
+  File "C:\Python314\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2717' in position 30: character maps to <undefined>
