@@ -29,3 +29,4 @@ pyyaml==6.0.2
 
 # Video processing (Phase 2)
 opencv-python
+ultralytics>=8.0.0

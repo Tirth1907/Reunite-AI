@@ -38,6 +38,10 @@ from pages.helper.fallback_detector import (
     FALLBACK_MIN_FACE_SIZE,
     FALLBACK_MIN_EMBEDDING_NORM,
 )
+from pages.helper.yolo_prescreener import (
+    has_face_yolo,
+    is_yolo_available,
+)
 
 # ============================================================
 # SPEED-CRITICAL FILE — READ BEFORE MODIFYING
@@ -85,7 +89,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-FRAME_INTERVAL_SECONDS = 3        # Extract one frame every 3 seconds (balances speed vs coverage)
+FRAME_INTERVAL_SECONDS = 3        # Legacy default (overridden by adaptive sampling below)
 TARGET_MAX_WIDTH = 1280            # Max width (only downscale, never upscale)
 TARGET_MAX_HEIGHT = 720            # Max height
 DEFAULT_CONFIDENCE_THRESHOLD = 0.40  # Cosine distance threshold (distance <= 0.40 = confidence >= 60%)
@@ -201,9 +205,9 @@ def _has_faces_fast(frame_bgr):
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     faces = cascade.detectMultiScale(
         gray,
-        scaleFactor=1.3,
-        minNeighbors=3,
-        minSize=(30, 30),
+        scaleFactor=1.1,
+        minNeighbors=5,
+        minSize=(60, 60),
         flags=cv2.CASCADE_SCALE_IMAGE,
     )
     return len(faces) > 0
@@ -220,93 +224,70 @@ def _cosine_distance(a, b):
     return 1.0 - (np.dot(a, b) / (norm_a * norm_b))
 
 
-def _detect_and_embed(frame_rgb, is_fallback_pass=False):
+def _detect_and_embed(frame_rgb, is_fallback_pass=False, yolo_boxes=None):
     """
-    Detect faces in a frame and return list of (embedding, facial_area).
-
-    Uses a multi-strategy approach for robustness with CCTV footage:
-    1. Try enforce_detection=True first (only real detected faces)
-    2. Fall back to enforce_detection=False if no faces found
-    3. Try both RetinaFace and OpenCV backends
-    4. Skip alignment if aligned version fails (handles missing landmarks)
-
-    When is_fallback_pass=True:
-    - enforce_detection=False (don't crash on missing faces)
-    - Face area minimum = 8px (instead of 15px)
-    - Embedding norm minimum = 0.3 (instead of 1.0)
-
-    Each facial_area is a dict with keys: x, y, w, h.
+    Extract face embeddings from a frame.
+    Pass 1 uses YOLO boxes to crop the face, then ArcFace embedding ONLY on the cropped face.
+    Bypasses RetinaFace entirely (uses detector_backend="skip").
     """
     from deepface import DeepFace
-
     faces = []
 
-    # Determine enforcement based on pass type
-    enforce = not is_fallback_pass  # True for Pass 1, False for fallback
+    if yolo_boxes is not None and len(yolo_boxes) > 0:
+        h_frame, w_frame = frame_rgb.shape[:2]
+        for box in yolo_boxes:
+            x1, y1, x2, y2 = box.get("x1", 0), box.get("y1", 0), box.get("x2", 0), box.get("y2", 0)
+            
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w_frame, x2), min(h_frame, y2)
+            
+            if x2 <= x1 or y2 <= y1:
+                continue
+                
+            face_crop = frame_rgb[y1:y2, x1:x2]
+            if face_crop.size == 0:
+                continue
+                
+            try:
+                results = DeepFace.represent(
+                    img_path=face_crop,
+                    model_name="ArcFace",
+                    detector_backend="skip",
+                    enforce_detection=False,
+                    align=True,
+                )
+                if results:
+                    embedding = results[0].get("embedding")
+                    if embedding:
+                        facial_area = {"x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1}
+                        faces.append((embedding, facial_area))
+            except Exception:
+                continue
+        return faces
 
-    # Strategy list: (detector_backend, enforce, align, label)
-    # Only 2 strategies — Haar pre-filter already confirmed a face exists (Pass 1)
-    strategies = [
-        ("retinaface", enforce, True, "retina+enforce+align"),
-        ("opencv", enforce, True, "opencv+enforce+align"),
-    ]
-
-    # Quality thresholds based on pass type
-    min_face_size = FALLBACK_MIN_FACE_SIZE if is_fallback_pass else 15
-    min_norm = FALLBACK_MIN_EMBEDDING_NORM if is_fallback_pass else 1.0
-
-    for detector, enforce_det, align, label in strategies:
-        try:
-            results = DeepFace.represent(
-                img_path=frame_rgb,
-                model_name="ArcFace",
-                detector_backend=detector,
-                enforce_detection=enforce_det,
-                align=align,
-            )
-        except Exception as e:
-            if is_fallback_pass:
-                logger.debug(f"[VIDEO] [FALLBACK] DeepFace strategy '{label}' failed: {e}")
-            # enforce_detection=True raises when no face found — that's expected
-            continue
-
+    # Fallback to OpenCV if no yolo_boxes provided
+    try:
+        results = DeepFace.represent(
+            img_path=frame_rgb,
+            model_name="ArcFace",
+            detector_backend="opencv",
+            enforce_detection=False,
+            align=True,
+        )
         if not results:
-            continue
-
-        for obj in results:
-            embedding = obj.get("embedding")
-            facial_area = obj.get("facial_area", {})
-
-            if not embedding or len(embedding) == 0:
-                continue
-
-            emb_arr = np.array(embedding, dtype=np.float64)
-
-            # Quality check: skip garbage embeddings (near-zero norm)
-            norm = np.linalg.norm(emb_arr)
-            if norm <= min_norm:
-                logger.debug(
-                    f"[VIDEO] Embedding norm too low: {norm:.4f} (min={min_norm})"
-                )
-                continue
-
-            # Quality check: skip if facial area is too small (likely noise)
-            face_w = facial_area.get("w", 0)
-            face_h = facial_area.get("h", 0)
-            if face_w > 0 and face_h > 0 and (face_w < min_face_size or face_h < min_face_size):
-                logger.debug(
-                    f"[VIDEO] Face too small: {face_w}x{face_h} (min={min_face_size})"
-                )
-                continue
-
-            faces.append((embedding, facial_area))
-
-        # If this strategy found valid faces, use them
-        if faces:
-            logger.debug(f"[VIDEO] Strategy '{label}' found {len(faces)} face(s)")
-            break
-
-    return faces
+            return []
+        for res in results:
+            embedding = res.get("embedding")
+            facial_area = res.get("facial_area", {})
+            face_confidence = res.get("face_confidence", 1.0)
+            if embedding and face_confidence >= 0.50:
+                face_w = facial_area.get("w", 0)
+                face_h = facial_area.get("h", 0)
+                if face_w >= 30 and face_h >= 30:
+                    faces.append((embedding, facial_area))
+        return faces
+    except Exception:
+        return []
 
 
 def _crop_face(frame_rgb, facial_area, padding=20):
@@ -377,6 +358,7 @@ def validate_video_file(file_path):
 def get_adaptive_frame_interval(duration_seconds: float, is_fallback_pass: bool = False) -> int:
     """
     Returns frame extraction interval in seconds.
+    Pass 1 uses adaptive intervals based on video length to reduce total frames.
     Fallback pass uses denser sampling for short videos
     to maximize detection chances.
     """
@@ -388,7 +370,8 @@ def get_adaptive_frame_interval(duration_seconds: float, is_fallback_pass: bool 
         elif duration_seconds <= 900:   return 6   # 10-15 min: every 6s
         else:                           return 10  # over 15 min: every 10s
     else:
-        # Pass 1: original adaptive sampling (unchanged)
+        # Pass 1: Aggressive adaptive sampling to reduce processing time
+        # video < 60s → every 0.5s, 1-5min → every 1s, 5-20min → every 2s, >20min → every 3s
         if duration_seconds <= 120:     return 3
         elif duration_seconds <= 300:   return 5
         elif duration_seconds <= 600:   return 8
@@ -441,7 +424,7 @@ def _run_processing_pass(
         t = 0.0
         while t < video_duration_seconds:
             extraction_times.append(t)
-            t += interval_seconds
+            t += float(interval_seconds)
 
         total_frames_to_process = len(extraction_times)
 
@@ -471,7 +454,8 @@ def _run_processing_pass(
 
         for frame_idx, timestamp_sec in enumerate(extraction_times):
             # Seek to the frame at the given timestamp
-            cap.set(cv2.CAP_PROP_POS_MSEC, timestamp_sec * 1000)
+            target_frame_number = int(timestamp_sec * fps)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame_number)
             ret, frame_bgr = cap.read()
 
             if not ret or frame_bgr is None:
@@ -501,7 +485,12 @@ def _run_processing_pass(
                         )
                     continue
             else:
-                if not _has_faces_fast(frame_bgr):
+                # Use YOLO pre-screener first (faster, ~15ms), fall back to Haar
+                face_detected = False
+                yolo_boxes = None
+                face_detected = _has_faces_fast(frame_bgr)
+
+                if not face_detected:
                     skipped_no_face += 1
                     processed += 1
                     del frame_bgr
@@ -516,10 +505,6 @@ def _run_processing_pass(
 
             # Convert BGR -> RGB for DeepFace
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-
-            # Apply preprocessing in fallback pass only (enhance contrast for low-light frames)
-            if is_fallback_pass:
-                frame_rgb = apply_clahe(frame_rgb)
 
             # Detect faces and get embeddings
             if is_fallback_pass:
