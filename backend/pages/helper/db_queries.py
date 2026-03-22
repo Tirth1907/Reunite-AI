@@ -546,3 +546,14 @@ def get_case_photo_path(case_id: str) -> str | None:
     if os.path.exists(photo_path):
         return photo_path
     return None
+
+
+def get_video_detections_by_video(video_id: str):
+    """Fetch all video detections for a given video_id, ordered by confidence descending."""
+    with Session(engine) as session:
+        results = session.exec(
+            select(VideoDetections)
+            .where(VideoDetections.video_id == video_id)
+            .order_by(VideoDetections.confidence.desc())
+        ).all()
+        return results

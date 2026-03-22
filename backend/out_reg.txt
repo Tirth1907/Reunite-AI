@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "C:\Users\tirth\OneDrive\Desktop\Reunite AI 2.0\backend\test_registration.py", line 14, in <module>
+    from pages.helper.registration_encoder import extract_registration_embedding
+  File "C:\Users\tirth\OneDrive\Desktop\Reunite AI 2.0\backend\pages\helper\registration_encoder.py", line 24, in <module>
+    from deepface import DeepFace
+  File "C:\Users\tirth\AppData\Roaming\Python\Python314\site-packages\deepface\DeepFace.py", line 15, in <module>
+    import tensorflow as tf
+ModuleNotFoundError: No module named 'tensorflow'

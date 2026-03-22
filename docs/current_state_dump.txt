@@ -1,0 +1,2210 @@
+===== FILE: backend/pages/helper/video_processor.py =====
+"""
+Reunite AI Phase 2 — Offline CCTV Batch Video Processor
+
+Processes uploaded CCTV videos frame-by-frame:
+1. Extracts frames every 2 seconds at 640x480
+2. Detects faces using RetinaFace
+3. Generates ArcFace embeddings
+4. Compares against a single missing case embedding
+5. Saves matched detections with cropped face images
+
+Designed for:
+- GTX 1650 (4GB VRAM) with CPU fallback
+- 16GB RAM, sequential processing
+- Up to 15-minute videos
+"""
+
+import os
+import base64
+import json
+import uuid
+import logging
+import traceback
+from datetime import datetime
+
+import cv2
+import numpy as np
+import PIL.Image
+
+from pages.helper import db_queries
+from pages.helper.data_models import VideoDetections
+from pages.helper.fallback_detector import (
+    detect_face_fallback,
+    has_face_loose,
+    get_fallback_frame_interval,
+    upscale_if_small,
+    apply_clahe,
+    FALLBACK_DISTANCE_THRESHOLD,
+    FALLBACK_MIN_CONFIDENCE,
+    FALLBACK_MIN_FACE_SIZE,
+    FALLBACK_MIN_EMBEDDING_NORM,
+)
+from pages.helper.yolo_prescreener import (
+    has_face_yolo,
+    is_yolo_available,
+)
+
+
+# ============================================================
+# SPEED-CRITICAL FILE — READ BEFORE MODIFYING
+# ============================================================
+# PROTECTED FILES (DO NOT MODIFY):
+#   backend/pages/helper/registration_encoder.py
+#   backend/pages/helper/fallback_detector.py
+#
+# FALLBACK PASS RULES:
+#   All fallback detection logic lives in fallback_detector.py
+#   Do NOT add DeepFace calls directly in the fallback pass here
+#   Do NOT add retry loops in the fallback pass
+#   Do NOT use retinaface in the fallback pass
+#   Do NOT disable has_face_loose() pre-filter
+#
+# PASS 1 RULES:
+#   Pass 1 uses retinaface — do NOT change this
+#   Pass 1 thresholds: distance=0.40, confidence=60%
+#   Do NOT modify Pass 1 when fixing fallback issues
+#
+# After any change to this file, run:
+#   python backend/test_speed.py
+#   python backend/test_registration.py
+# ============================================================
+
+# ============================================================
+# IMPORTANT: THIS FILE HANDLES VIDEO PROCESSING ONLY
+# ============================================================
+# Do NOT add registration logic to this file.
+# Do NOT copy preprocessing patterns from here to cases.py
+# Do NOT modify Pass 1 logic when improving fallback pass.
+#
+# Registration embedding extraction lives in:
+# backend/pages/helper/registration_encoder.py
+#
+# Pass 1 (strict CCTV) and fallback pass are separate code paths.
+# Modifying the fallback pass must never affect Pass 1.
+# ============================================================
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logger = logging.getLogger(__name__)
+
+# Haar cascade pre-filter for fast face detection
+_HAAR_CASCADE = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+FRAME_INTERVAL_SECONDS = 3        # Legacy default (overridden by adaptive sampling below)
+TARGET_MAX_WIDTH = 1280            # Max width (only downscale, never upscale)
+TARGET_MAX_HEIGHT = 720            # Max height
+DEFAULT_CONFIDENCE_THRESHOLD = 0.40  # Cosine distance threshold (distance <= 0.40 = confidence >= 60%)
+PROGRESS_UPDATE_INTERVAL = 10     # Update DB progress every N frames
+SUPPRESSION_WINDOW_SEC = 3        # Suppress similar consecutive detections within this gap
+SUPPRESSION_SIMILARITY = 0.10     # Cosine distance below this = same face (skip)
+MIN_CONFIDENCE_PERCENT = 60       # Hard floor: never save detections below this confidence
+MAX_VIDEO_SIZE_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
+
+
+
+# Directories
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+VIDEO_UPLOADS_DIR = os.path.join(BASE_DIR, "video_uploads")
+# Ensure directories exist
+os.makedirs(VIDEO_UPLOADS_DIR, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# GPU / CPU Detection
+# ---------------------------------------------------------------------------
+_device_info = None
+
+
+def get_device_info():
+    """Detect CUDA availability and configure TensorFlow VRAM limits."""
+    global _device_info
+    if _device_info is not None:
+        return _device_info
+
+    try:
+        import tensorflow as tf
+        gpus = tf.config.list_physical_devices("GPU")
+        if gpus:
+            # Limit VRAM to 2GB to leave headroom on 4GB GTX 1650
+            try:
+                tf.config.set_logical_device_configuration(
+                    gpus[0],
+                    [tf.config.LogicalDeviceConfiguration(memory_limit=2048)],
+                )
+            except RuntimeError:
+                # Virtual devices must be set before GPUs are initialized
+                pass
+            _device_info = {
+                "device": "GPU",
+                "name": gpus[0].name,
+                "vram_limit_mb": 2048,
+            }
+            logger.info(f"[VIDEO] GPU detected: {gpus[0].name}, VRAM limited to 2048 MB")
+            return _device_info
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.warning(f"[VIDEO] GPU detection failed: {e}")
+
+    # CPU fallback
+    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+    _device_info = {"device": "CPU", "name": "CPU fallback", "vram_limit_mb": 0}
+    logger.info("[VIDEO] Using CPU fallback (no CUDA GPU detected)")
+    return _device_info
+
+
+# ---------------------------------------------------------------------------
+# DeepFace lazy loader
+# ---------------------------------------------------------------------------
+_deepface_loaded = False
+
+
+def _ensure_deepface():
+    """Lazy-import DeepFace so the server starts fast."""
+    global _deepface_loaded
+    if _deepface_loaded:
+        return True
+    try:
+        get_device_info()  # configure GPU first
+        from deepface import DeepFace  # noqa: F401
+        _deepface_loaded = True
+        logger.info("[VIDEO] DeepFace loaded successfully")
+        return True
+    except ImportError:
+        logger.error("[VIDEO] DeepFace is not installed")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Core helpers
+# ---------------------------------------------------------------------------
+
+
+def _cosine_distance(a, b):
+    """Cosine distance between two vectors. Returns 0.0 (identical) to 2.0."""
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    norm_a = np.linalg.norm(a)
+    norm_b = np.linalg.norm(b)
+    if norm_a == 0 or norm_b == 0:
+        return 1.0
+    return 1.0 - (np.dot(a, b) / (norm_a * norm_b))
+
+
+def _has_faces_fast(frame_rgb) -> bool:
+    """Haar cascade pre-filter. Returns True if any face detected."""
+    gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
+    faces = _HAAR_CASCADE.detectMultiScale(
+        gray,
+        scaleFactor=1.1,
+        minNeighbors=5,
+        minSize=(60, 60),
+    )
+    return len(faces) > 0
+
+def _detect_and_embed(frame_rgb, is_fallback_pass=False, yolo_boxes=None):
+    """
+    Extract face embeddings from a frame.
+    Pass 1 uses YOLO boxes to crop the face, then ArcFace embedding ONLY on the cropped face.
+    Bypasses RetinaFace entirely (uses detector_backend="skip").
+    """
+    from deepface import DeepFace
+    faces = []
+
+    if yolo_boxes is not None and len(yolo_boxes) > 0:
+        h_frame, w_frame = frame_rgb.shape[:2]
+        for box in yolo_boxes:
+            x1, y1, x2, y2 = box.get("x1", 0), box.get("y1", 0), box.get("x2", 0), box.get("y2", 0)
+            
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w_frame, x2), min(h_frame, y2)
+            
+            if x2 <= x1 or y2 <= y1:
+                continue
+                
+            face_crop = frame_rgb[y1:y2, x1:x2]
+            if face_crop.size == 0:
+                continue
+                
+            try:
+                results = DeepFace.represent(
+                    img_path=face_crop,
+                    model_name="ArcFace",
+                    detector_backend="skip",
+                    enforce_detection=False,
+                    align=True,
+                )
+                if results:
+                    embedding = results[0].get("embedding")
+                    if embedding:
+                        facial_area = {"x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1}
+                        try:
+                            face_crop_bgr = cv2.cvtColor(face_crop, cv2.COLOR_RGB2BGR)
+                            face_crop_bgr = cv2.resize(face_crop_bgr, (160, 160))
+                            _, buffer = cv2.imencode(".jpg", face_crop_bgr)
+                            yolo_face_b64 = base64.b64encode(buffer).decode("utf-8")
+                        except Exception:
+                            yolo_face_b64 = None
+                        faces.append((embedding, facial_area, yolo_face_b64))
+            except Exception:
+                continue
+        return faces
+
+    # Fallback to OpenCV if no yolo_boxes provided
+    try:
+        results = DeepFace.represent(
+            img_path=frame_rgb,
+            model_name="ArcFace",
+            detector_backend="opencv",
+            enforce_detection=False,
+            align=True,
+        )
+        if not results:
+            return []
+        for res in results:
+            embedding = res.get("embedding")
+            facial_area = res.get("facial_area", {})
+            face_confidence = res.get("face_confidence", 1.0)
+            if embedding and face_confidence >= 0.50:
+                face_w = facial_area.get("w", 0)
+                face_h = facial_area.get("h", 0)
+                # Generate base64 thumbnail from facial area
+                try:
+                    fx = max(0, facial_area.get("x", 0))
+                    fy = max(0, facial_area.get("y", 0))
+                    fw = facial_area.get("w", 0)
+                    fh = facial_area.get("h", 0)
+                    if fw > 0 and fh > 0:
+                        face_crop = frame_rgb[fy:fy+fh, fx:fx+fw]
+                        face_crop_bgr = cv2.cvtColor(face_crop, cv2.COLOR_RGB2BGR)
+                        face_crop_bgr = cv2.resize(face_crop_bgr, (160, 160))
+                        _, buffer = cv2.imencode(".jpg", face_crop_bgr)
+                        face_b64 = base64.b64encode(buffer).decode("utf-8")
+                    else:
+                        face_b64 = None
+                except Exception:
+                    face_b64 = None
+                if face_w >= 30 and face_h >= 30:
+                    faces.append((embedding, facial_area, face_b64))
+        return faces
+    except Exception as e:
+        logger.warning(f"[VIDEO] _detect_and_embed failed: {e}")
+        return []
+
+
+def _crop_face(frame_rgb, facial_area, padding=20):
+    """Crop a face region from the frame with padding."""
+    h, w = frame_rgb.shape[:2]
+    x = max(0, facial_area.get("x", 0) - padding)
+    y = max(0, facial_area.get("y", 0) - padding)
+    x2 = min(w, facial_area.get("x", 0) + facial_area.get("w", 0) + padding)
+    y2 = min(h, facial_area.get("y", 0) + facial_area.get("h", 0) + padding)
+
+    if x2 <= x or y2 <= y:
+        return None
+
+    cropped = frame_rgb[y:y2, x:x2]
+    return cropped
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+ALLOWED_EXTENSIONS = {".mp4", ".avi", ".mkv", ".mov", ".wmv"}
+
+
+def validate_video_file(file_path):
+    """Validate that the file is a playable video. Returns (ok, error_msg)."""
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        return False, f"Unsupported format: {ext}. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
+
+    file_size = os.path.getsize(file_path)
+    if file_size > MAX_VIDEO_SIZE_BYTES:
+        return False, f"File too large: {file_size / (1024**3):.1f} GB. Max: 2 GB"
+
+    cap = cv2.VideoCapture(file_path)
+    if not cap.isOpened():
+        cap.release()
+        return False, "Cannot open video file. It may be corrupt."
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+
+    if fps <= 0 or frame_count <= 0:
+        return False, "Invalid video: cannot determine FPS or frame count."
+
+    duration_sec = frame_count / fps
+    if duration_sec > 1800:  # 30 minutes max
+        return False, f"Video too long: {duration_sec/60:.0f} minutes. Max: 30 minutes."
+
+    return True, None
+
+
+# ---------------------------------------------------------------------------
+# Processing Pass Helper
+# ---------------------------------------------------------------------------
+
+def get_adaptive_frame_interval(duration_seconds: float, is_fallback_pass: bool = False) -> int:
+    """
+    Returns frame extraction interval in seconds.
+    Pass 1 uses adaptive intervals based on video length to reduce total frames.
+    Fallback pass uses denser sampling for short videos
+    to maximize detection chances.
+    """
+    if is_fallback_pass:
+        # Denser sampling in fallback for better detection
+        if duration_seconds <= 90:      return 1   # short: every 1s
+        elif duration_seconds <= 300:   return 2   # 1.5-5 min: every 2s
+        elif duration_seconds <= 600:   return 4   # 5-10 min: every 4s
+        elif duration_seconds <= 900:   return 6   # 10-15 min: every 6s
+        else:                           return 10  # over 15 min: every 10s
+    else:
+        # Pass 1: Aggressive adaptive sampling to reduce processing time
+        # video < 60s → every 0.5s, 1-5min → every 1s, 5-20min → every 2s, >20min → every 3s
+        if duration_seconds <= 120:     return 3
+        elif duration_seconds <= 300:   return 5
+        elif duration_seconds <= 600:   return 8
+        elif duration_seconds <= 900:   return 12
+        else:                           return 15
+
+
+def _run_processing_pass(
+    video_path: str,
+    all_case_embeddings: list,
+    video_id: str,
+    confidence_threshold: float,
+    min_confidence_percent: int,
+    is_fallback_pass: bool = False,
+):
+    """
+    Run a single processing pass over the video.
+
+    Extracts frames, detects faces, generates embeddings, compares against
+    the target embedding, and saves matched detections.
+
+    When is_fallback_pass=True, every saved detection is tagged with
+    is_low_confidence=True.
+
+    Returns the number of detections saved during this pass.
+    """
+    pass_label = "PASS-2-FALLBACK" if is_fallback_pass else "PASS-1-STRICT"
+    logger.info(
+        f"[VIDEO] [{pass_label}] Starting pass: threshold={confidence_threshold}, "
+        f"min_conf={min_confidence_percent}%, fallback={is_fallback_pass}"
+    )
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video file: {video_path}")
+
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        video_duration_seconds = total_video_frames / fps if fps > 0 else 0
+
+        # Calculate how many frames we'll extract (adaptive)
+        if is_fallback_pass:
+            interval_seconds = get_fallback_frame_interval(video_duration_seconds)
+        else:
+            interval_seconds = get_adaptive_frame_interval(video_duration_seconds)
+
+        extraction_times = []
+        t = 0.0
+        while t < video_duration_seconds:
+            extraction_times.append(t)
+            t += float(interval_seconds)
+
+        total_frames_to_process = len(extraction_times)
+
+        logger.info(
+            f"[VIDEO] [{pass_label}] Video info: fps={fps:.1f}, total_frames={total_video_frames}, "
+            f"duration={video_duration_seconds:.1f}s, frames_to_extract={total_frames_to_process}"
+        )
+
+        # Update total frames in DB (only on first pass)
+        if not is_fallback_pass:
+            db_queries.update_video_status(
+                video_id, status="processing", total_frames=total_frames_to_process
+            )
+
+        # ---- Frame-by-frame processing ----
+        detections_buffer = []
+        processed = 0
+        detection_count = 0
+        skipped_no_face = 0
+
+        # Dedup state — simple: track last saved timestamp + embedding
+        last_saved_timestamp = -999.0
+        last_saved_embedding = None  # np.ndarray or None
+
+        # Rule 3: Ensure DB unique index exists
+        db_queries.ensure_video_detections_index()
+
+        for frame_idx, timestamp_sec in enumerate(extraction_times):
+            # Seek to the frame at the given timestamp
+            target_frame_number = int(timestamp_sec * fps)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame_number)
+            ret, frame_bgr = cap.read()
+
+            if not ret or frame_bgr is None:
+                processed += 1
+                continue
+
+            # Resize only if frame is larger than max (preserve quality for CCTV)
+            h_orig, w_orig = frame_bgr.shape[:2]
+            if w_orig > TARGET_MAX_WIDTH or h_orig > TARGET_MAX_HEIGHT:
+                scale = min(TARGET_MAX_WIDTH / w_orig, TARGET_MAX_HEIGHT / h_orig)
+                new_w = int(w_orig * scale)
+                new_h = int(h_orig * scale)
+                frame_bgr = cv2.resize(frame_bgr, (new_w, new_h))
+
+            # --- Fast pre-filter: skip frames with no faces ---
+            if is_fallback_pass:
+                if not has_face_loose(frame_bgr):
+                    skipped_no_face += 1
+                    processed += 1
+                    del frame_bgr
+                    if processed % PROGRESS_UPDATE_INTERVAL == 0:
+                        db_queries.update_video_status(
+                            video_id,
+                            status="processing",
+                            processed_frames=processed,
+                            total_detections=detection_count,
+                        )
+                    continue
+            else:
+                # Use YOLO pre-screener first (faster, ~15ms), fall back to Haar
+                face_detected = False
+                yolo_boxes = None
+                frame_rgb_pre = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                face_detected = _has_faces_fast(frame_rgb_pre)
+
+                if not face_detected:
+                    skipped_no_face += 1
+                    processed += 1
+                    del frame_bgr
+                    if processed % PROGRESS_UPDATE_INTERVAL == 0:
+                        db_queries.update_video_status(
+                            video_id,
+                            status="processing",
+                            processed_frames=processed,
+                            total_detections=detection_count,
+                        )
+                    continue
+
+                # Convert BGR -> RGB for DeepFace (Pass 1 only)
+                frame_rgb = frame_rgb_pre
+
+            # For fallback pass, frame_rgb_pre was never assigned above — convert here
+            if is_fallback_pass:
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+            # Detect faces and get embeddings
+            if is_fallback_pass:
+                frame_rgb = apply_clahe(frame_rgb)
+                results = detect_face_fallback(frame_rgb)
+                faces = []
+                for res in results:
+                    embedding = res.get("embedding")
+                    facial_area = res.get("facial_area", {})
+                    if not embedding: continue
+                    face_w = facial_area.get("w", 0)
+                    face_h = facial_area.get("h", 0)
+                    if face_w < FALLBACK_MIN_FACE_SIZE or face_h < FALLBACK_MIN_FACE_SIZE:
+                        continue
+                    if np.linalg.norm(embedding) <= FALLBACK_MIN_EMBEDDING_NORM:
+                        continue
+                    faces.append((embedding, facial_area, None))
+            else:
+
+                faces = _detect_and_embed(frame_rgb, is_fallback_pass=False)
+
+            # ---- Rule 1: Best match per face across ALL registered cases ----
+            best_frame_match = None  # (distance, confidence, embedding_arr, facial_area, face_b64, matched_case_id)
+
+            for embedding, facial_area, face_b64 in faces:
+                embedding_arr = np.array(embedding, dtype=np.float64)
+
+                for case_entry in all_case_embeddings:
+                    case_embedding = case_entry["embedding"]
+                    matched_case_id = case_entry["case_id"]
+
+                    if len(embedding_arr) != len(case_embedding):
+                        continue
+
+                    distance = _cosine_distance(case_embedding, embedding_arr)
+                    confidence = (1.0 - distance) * 100.0
+
+                    if is_fallback_pass:
+                        if (distance <= FALLBACK_DISTANCE_THRESHOLD and
+                                confidence >= FALLBACK_MIN_CONFIDENCE):
+                            if best_frame_match is None or confidence > best_frame_match[1]:
+                                best_frame_match = (distance, confidence, embedding_arr, facial_area, face_b64, matched_case_id)
+                    else:
+                        if distance <= confidence_threshold and confidence >= min_confidence_percent:
+                            if best_frame_match is None or confidence > best_frame_match[1]:
+                                best_frame_match = (distance, confidence, embedding_arr, facial_area, face_b64, matched_case_id)
+
+            # ---- Rule 2: Suppress consecutive similar detections ----
+            if best_frame_match is not None:
+                _, confidence, embedding_arr, facial_area, face_b64, matched_case_id = best_frame_match
+
+                suppressed = False
+                time_gap = timestamp_sec - last_saved_timestamp
+
+                if time_gap < SUPPRESSION_WINDOW_SEC and last_saved_embedding is not None:
+                    face_dist = _cosine_distance(last_saved_embedding, embedding_arr)
+                    if face_dist < SUPPRESSION_SIMILARITY:
+                        logger.info(
+                            f"[DEDUP] [{pass_label}] Suppressed at {timestamp_sec:.1f}s: "
+                            f"gap={time_gap:.1f}s, face_dist={face_dist:.4f}"
+                        )
+                        suppressed = True
+
+                if not suppressed:
+                    # Save this detection
+                    detection_id = str(uuid.uuid4())
+
+                    detection = VideoDetections(
+                        id=detection_id,
+                        video_id=video_id,
+                        case_id=matched_case_id,
+                        timestamp_seconds=round(timestamp_sec, 2),
+                        confidence=round(confidence, 2),
+                        cropped_face_path=None,
+                        face_thumbnail=face_b64,
+                        frame_number=frame_idx,
+                        is_low_confidence=is_fallback_pass,
+                    )
+
+                    detections_buffer.append(detection)
+                    detection_count += 1
+                    last_saved_timestamp = timestamp_sec
+                    last_saved_embedding = embedding_arr
+
+                    logger.info(
+                        f"[VIDEO] [{pass_label}] SAVED at {timestamp_sec:.1f}s: "
+                        f"conf={confidence:.1f}%, id={detection_id[:8]}"
+                    )
+
+            # Release frame memory
+            del frame_bgr, frame_rgb
+
+            processed += 1
+
+            # Flush detections and update progress periodically
+            if processed % PROGRESS_UPDATE_INTERVAL == 0:
+                if detections_buffer:
+                    db_queries.save_video_detections_batch(detections_buffer)
+                    detections_buffer = []
+                db_queries.update_video_status(
+                    video_id,
+                    status="processing",
+                    processed_frames=processed,
+                    total_detections=detection_count,
+                )
+                logger.info(
+                    f"[VIDEO] [{pass_label}] Progress: {processed}/{total_frames_to_process} frames, "
+                    f"{detection_count} detections, {skipped_no_face} skipped"
+                )
+
+        # ---- Flush remaining detections ----
+        if detections_buffer:
+            db_queries.save_video_detections_batch(detections_buffer)
+            detections_buffer = []
+
+        logger.info(
+            f"[VIDEO] [{pass_label}] COMPLETE: frames={processed}, "
+            f"detections={detection_count}, skipped_no_face={skipped_no_face}"
+        )
+
+        return detection_count
+
+    finally:
+        cap.release()
+
+
+# ---------------------------------------------------------------------------
+# Main Processing Pipeline (Two-Pass)
+# ---------------------------------------------------------------------------
+
+def process_video(video_id: str):
+    """
+    Main entry point for background video processing.
+
+    Two-pass system:
+      Pass 1 — Strict thresholds (existing logic, unchanged)
+      Pass 2 — Fallback with relaxed thresholds (only if Pass 1 finds 0 detections)
+
+    1. Loads the target case embedding from the database
+    2. Runs Pass 1 with strict thresholds
+    3. If Pass 1 finds 0 detections, runs Pass 2 with fallback thresholds
+    4. Saves detections to the database
+    """
+    logger.info(f"[VIDEO] ========== Starting processing for video {video_id} ==========")
+
+    # ---- Load upload record ----
+    upload = db_queries.get_video_upload(video_id)
+    if not upload:
+        logger.error(f"[VIDEO] Upload record {video_id} not found in database")
+        return
+
+    case_id = upload.case_id
+    file_path = upload.file_path
+    threshold = upload.confidence_threshold
+
+    # Clamp: never allow distance threshold above DEFAULT_CONFIDENCE_THRESHOLD
+    if threshold > DEFAULT_CONFIDENCE_THRESHOLD:
+        logger.warning(
+            f"[VIDEO] Clamping user threshold {threshold} -> {DEFAULT_CONFIDENCE_THRESHOLD}"
+        )
+        threshold = DEFAULT_CONFIDENCE_THRESHOLD
+
+    # ---- Update status to processing ----
+    db_queries.update_video_status(video_id, status="processing")
+
+    try:
+        # ---- Load target case embedding ----
+        face_mesh_json = db_queries.get_case_embedding(case_id)
+        if not face_mesh_json:
+            raise ValueError(f"Case {case_id} has no face embedding in the database")
+
+        target_embedding = json.loads(face_mesh_json)
+        if not target_embedding or len(target_embedding) == 0:
+            raise ValueError(f"Case {case_id} has an empty/invalid face embedding")
+
+        target_embedding = np.array(target_embedding, dtype=np.float64)
+        logger.info(f"[VIDEO] Target embedding loaded: case={case_id}, dim={len(target_embedding)}")
+
+        # Load ALL registered NF case embeddings for multi-case scanning
+        from sqlmodel import Session, select
+        from pages.helper.data_models import RegisteredCases
+        from pages.helper.db_queries import engine
+        all_case_embeddings = []
+        with Session(engine) as session:
+            rows = session.exec(
+                select(RegisteredCases.id, RegisteredCases.face_mesh)
+                .where(RegisteredCases.status == "NF")
+            ).all()
+        for row_id, row_mesh in rows:
+            try:
+                emb = json.loads(row_mesh)
+                if emb and len(emb) > 0:
+                    all_case_embeddings.append({
+                        "case_id": row_id,
+                        "embedding": np.array(emb, dtype=np.float64),
+                    })
+            except Exception:
+                continue
+        if not all_case_embeddings:
+            raise ValueError("No registered NF cases with valid embeddings found")
+        logger.info(f"[VIDEO] Loaded {len(all_case_embeddings)} NF case embeddings for scanning")
+
+        # ---- Ensure DeepFace is ready ----
+        if not _ensure_deepface():
+            raise RuntimeError("DeepFace is not available. Install with: pip install deepface")
+
+        # ==================================================================
+        # PASS 1 — Strict thresholds
+        # ==================================================================
+        pass1_count = _run_processing_pass(
+            video_path=file_path,
+            all_case_embeddings=all_case_embeddings,
+            video_id=video_id,
+            confidence_threshold=threshold,
+            min_confidence_percent=MIN_CONFIDENCE_PERCENT,
+            is_fallback_pass=False,
+        )
+
+        # Check how many detections Pass 1 actually saved
+        db_detection_count = db_queries.get_detection_count_for_video(video_id)
+
+        if db_detection_count == 0:
+            # ==============================================================
+            # PASS 2 — Fallback with relaxed thresholds
+            # ==============================================================
+            logger.info(
+                f"[VIDEO] Pass 1 found 0 detections. Triggering fallback Pass 2 "
+                f"(threshold={FALLBACK_DISTANCE_THRESHOLD}, "
+                f"min_conf={FALLBACK_MIN_CONFIDENCE}%)"
+            )
+
+            pass2_count = _run_processing_pass(
+                video_path=file_path,
+                all_case_embeddings=all_case_embeddings,
+                video_id=video_id,
+                confidence_threshold=FALLBACK_DISTANCE_THRESHOLD,
+                min_confidence_percent=FALLBACK_MIN_CONFIDENCE,
+                is_fallback_pass=True,
+            )
+
+            # Mark that fallback was used on the upload record
+            db_queries.update_video_fallback(video_id, used_fallback=True)
+
+            total_detections = pass2_count
+            logger.info(f"[VIDEO] Pass 2 completed with {pass2_count} detections.")
+        else:
+            total_detections = db_detection_count
+            logger.info(
+                f"[VIDEO] Pass 1 found {db_detection_count} detections. "
+                f"Fallback not needed."
+            )
+
+        # ---- Mark as complete ----
+        db_queries.update_video_status(
+            video_id,
+            status="done",
+            total_detections=total_detections,
+            completed_at=datetime.utcnow(),
+        )
+
+        logger.info(
+            f"[VIDEO] ========== COMPLETE: video={video_id}, "
+            f"total_detections={total_detections} =========="
+        )
+
+    except Exception as e:
+        error_msg = f"{type(e).__name__}: {str(e)}"
+        logger.error(f"[VIDEO] Processing FAILED for video {video_id}: {error_msg}")
+        traceback.print_exc()
+        db_queries.update_video_status(
+            video_id,
+            status="failed",
+            error_message=error_msg[:500],
+        )
+
+    finally:
+        logger.info(f"[VIDEO] Resources released for video {video_id}")
+
+===== END: backend/pages/helper/video_processor.py =====
+
+===== FILE: backend/api/routers/video.py =====
+"""
+Reunite AI Phase 2 — Video Analysis API Router
+
+Endpoints:
+  POST /api/v2/video/upload           Upload CCTV video + select case
+  GET  /api/v2/video/status/{video_id} Poll processing progress
+  GET  /api/v2/video/results/{case_id} Fetch detection results for a case
+"""
+
+import os
+import uuid
+from typing import List, Optional
+from datetime import datetime
+
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form, BackgroundTasks
+from pydantic import BaseModel
+
+from pages.helper import db_queries
+from pages.helper.data_models import VideoUploads
+from pages.helper.video_processor import (
+    VIDEO_UPLOADS_DIR,
+    ALLOWED_EXTENSIONS,
+    validate_video_file,
+    process_video,
+)
+
+router = APIRouter()
+
+
+# ---------------------------------------------------------------------------
+# Response models
+# ---------------------------------------------------------------------------
+
+class VideoUploadResponse(BaseModel):
+    video_id: str
+    case_id: str
+    status: str
+    message: str
+
+
+class VideoStatusResponse(BaseModel):
+    video_id: str
+    status: str
+    total_frames: Optional[int] = None
+    processed_frames: int = 0
+    total_detections: int = 0
+    progress_percent: float = 0.0
+    error_message: Optional[str] = None
+
+
+class DetectionItem(BaseModel):
+    id: str
+    video_id: str
+    video_location: Optional[str] = None
+    timestamp_seconds: float
+    timestamp_display: str
+    confidence: float
+    cropped_face_url: str
+    face_thumbnail: Optional[str] = None
+    case_id: str = ""
+    is_low_confidence: bool = False
+    detected_at: Optional[datetime] = None
+
+
+class VideoResultsResponse(BaseModel):
+    case_id: str
+    case_name: Optional[str] = None
+    total_videos_analyzed: int = 0
+    used_fallback: bool = False
+    detections: List[DetectionItem] = []
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _format_timestamp(seconds: float) -> str:
+    """Convert seconds to HH:MM:SS display string."""
+    total = int(seconds)
+    hrs = total // 3600
+    mins = (total % 3600) // 60
+    secs = total % 60
+    if hrs > 0:
+        return f"{hrs:02d}:{mins:02d}:{secs:02d}"
+    return f"{mins:02d}:{secs:02d}"
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+@router.post("/upload", response_model=VideoUploadResponse, status_code=201)
+async def upload_video(
+    video: UploadFile = File(...),
+    case_id: str = Form(...),
+    video_location: str = Form(""),
+    confidence_threshold: float = Form(0.40),
+    background_tasks: BackgroundTasks = None,
+):
+    """
+    Upload a CCTV video file for analysis against a specific missing case.
+
+    - **video**: Video file (.mp4, .avi, .mkv, .mov, .wmv) — max 2 GB
+    - **case_id**: ID of the registered missing case to match against
+    - **video_location**: Optional CCTV camera location description
+    - **confidence_threshold**: Match threshold (0.0–1.0). Default 0.60
+    """
+    # Validate case exists
+    case_detail = db_queries.get_registered_case_detail(case_id)
+    if not case_detail:
+        raise HTTPException(status_code=404, detail="Selected case not found in database.")
+
+    # Validate file extension
+    ext = os.path.splitext(video.filename or "")[1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file format '{ext}'. Allowed: {', '.join(ALLOWED_EXTENSIONS)}",
+        )
+
+    # Save video file to disk
+    video_id = str(uuid.uuid4())
+    safe_filename = f"{video_id}{ext}"
+    file_path = os.path.join(VIDEO_UPLOADS_DIR, safe_filename)
+
+    os.makedirs(VIDEO_UPLOADS_DIR, exist_ok=True)
+
+    try:
+        contents = await video.read()
+        with open(file_path, "wb") as f:
+            f.write(contents)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save video: {str(e)}")
+
+    # Validate video after saving
+    ok, error = validate_video_file(file_path)
+    if not ok:
+        os.remove(file_path)
+        raise HTTPException(status_code=400, detail=error)
+
+    # Clamp threshold to safe maximum (0.40 distance = 60% confidence floor)
+    confidence_threshold = min(confidence_threshold, 0.40)
+
+    # Create database record
+    upload_record = VideoUploads(
+        id=video_id,
+        filename=video.filename or safe_filename,
+        file_path=file_path,
+        case_id=case_id,
+        status="queued",
+        video_location=video_location or None,
+        confidence_threshold=confidence_threshold,
+    )
+    db_queries.create_video_upload(upload_record)
+
+    # Start background processing
+    if background_tasks:
+        background_tasks.add_task(process_video, video_id)
+
+    return VideoUploadResponse(
+        video_id=video_id,
+        case_id=case_id,
+        status="queued",
+        message="Video uploaded successfully. Processing will begin shortly.",
+    )
+
+
+@router.get("/status/{video_id}", response_model=VideoStatusResponse)
+async def get_video_status(video_id: str):
+    """
+    Poll the processing status of an uploaded video.
+
+    Returns current progress (frames processed / total) and detection count.
+    """
+    upload = db_queries.get_video_upload(video_id)
+    if not upload:
+        raise HTTPException(status_code=404, detail="Video upload not found.")
+
+    progress = 0.0
+    if upload.total_frames and upload.total_frames > 0:
+        progress = round((upload.processed_frames / upload.total_frames) * 100, 1)
+
+    return VideoStatusResponse(
+        video_id=upload.id,
+        status=upload.status,
+        total_frames=upload.total_frames,
+        processed_frames=upload.processed_frames,
+        total_detections=upload.total_detections,
+        progress_percent=progress,
+        error_message=upload.error_message,
+    )
+
+
+@router.get("/video-results/{video_id}", response_model=VideoResultsResponse)
+async def get_results_by_video(video_id: str):
+    """
+    Fetch all detection results for a specific video upload.
+    Returns detections regardless of which case_id they matched.
+    """
+    upload = db_queries.get_video_upload(video_id)
+    if not upload:
+        raise HTTPException(status_code=404, detail="Video upload not found.")
+
+    case_id = upload.case_id
+    case_detail = db_queries.get_registered_case_detail(case_id)
+    case_name = None
+    if case_detail and len(case_detail) > 0:
+        case_name = case_detail[0][0] if isinstance(case_detail[0], tuple) else None
+
+    detections = db_queries.get_video_detections_by_video(video_id)
+
+    detection_items = []
+    for det in (detections or []):
+        detection_items.append(DetectionItem(
+            id=det.id,
+            video_id=det.video_id,
+            video_location=upload.video_location,
+            timestamp_seconds=det.timestamp_seconds,
+            timestamp_display=_format_timestamp(det.timestamp_seconds),
+            confidence=det.confidence,
+            cropped_face_url=f"/resources/{det.cropped_face_path}" if det.cropped_face_path else "",
+            face_thumbnail=getattr(det, 'face_thumbnail', None),
+            case_id=det.case_id,
+            is_low_confidence=getattr(det, 'is_low_confidence', False),
+            detected_at=det.detected_at,
+        ))
+
+    all_uploads_for_case = db_queries.get_video_uploads_by_case(case_id)
+    total_analyzed = len(all_uploads_for_case) if all_uploads_for_case else 1
+
+    return VideoResultsResponse(
+        case_id=case_id,
+        case_name=case_name,
+        total_videos_analyzed=total_analyzed,
+        used_fallback=getattr(upload, 'used_fallback', False),
+        detections=detection_items,
+    )
+
+
+@router.get("/results/{case_id}", response_model=VideoResultsResponse)
+async def get_video_results(case_id: str):
+    """
+    Fetch all video detection results for a specific missing case.
+
+    Returns matched timestamps, confidence scores, cropped face URLs,
+    and the CCTV location for each detection.
+    """
+    # Get case name
+    case_detail = db_queries.get_registered_case_detail(case_id)
+    case_name = None
+    if case_detail and len(case_detail) > 0:
+        case_name = case_detail[0][0] if isinstance(case_detail[0], tuple) else None
+
+    # Get all video uploads for this case
+    uploads = db_queries.get_video_uploads_by_case(case_id)
+    upload_map = {u.id: u for u in uploads} if uploads else {}
+
+    # Get all detections for this case
+    detections = db_queries.get_video_detections_by_case(case_id)
+
+    detection_items = []
+    for det in (detections or []):
+        vid_upload = upload_map.get(det.video_id)
+        video_location = vid_upload.video_location if vid_upload else None
+
+        detection_items.append(DetectionItem(
+            id=det.id,
+            video_id=det.video_id,
+            video_location=video_location,
+            timestamp_seconds=det.timestamp_seconds,
+            timestamp_display=_format_timestamp(det.timestamp_seconds),
+            confidence=det.confidence,
+            cropped_face_url=f"/resources/{det.cropped_face_path}" if det.cropped_face_path else "",
+            face_thumbnail=getattr(det, 'face_thumbnail', None),
+            case_id=det.case_id,
+            is_low_confidence=getattr(det, 'is_low_confidence', False),
+            detected_at=det.detected_at,
+        ))
+
+    # Check if any upload used fallback
+    any_used_fallback = any(
+        getattr(u, 'used_fallback', False) for u in (uploads or [])
+    )
+
+    return VideoResultsResponse(
+        case_id=case_id,
+        case_name=case_name,
+        total_videos_analyzed=len(upload_map),
+        used_fallback=any_used_fallback,
+        detections=detection_items,
+    )
+
+===== END: backend/api/routers/video.py =====
+
+===== FILE: frontend/src/app/services/api.ts =====
+/**
+ * Reunite AI API Service
+ * Centralized API client for communicating with the FastAPI backend
+ */
+
+const API_BASE = 'http://127.0.0.1:8000/api/v1';
+
+// Helper function for making API requests
+async function apiRequest<T>(
+    endpoint: string,
+    options: RequestInit = {}
+): Promise<T> {
+    const token = localStorage.getItem('reunite_token');
+
+    const headers: Record<string, string> = {
+        ...(options.headers as Record<string, string>),
+    };
+
+    // Add auth token if available
+    if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+    }
+
+    // Add content-type for JSON requests (not for FormData)
+    if (!(options.body instanceof FormData)) {
+        headers['Content-Type'] = 'application/json';
+    }
+
+    const response = await fetch(`${API_BASE}${endpoint}`, {
+        ...options,
+        headers,
+    });
+
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({ detail: 'Request failed' }));
+        throw new Error(error.detail || `HTTP error ${response.status}`);
+    }
+
+    return response.json();
+}
+
+// ============ Auth API ============
+
+export interface LoginResponse {
+    access_token: string;
+    token_type: string;
+    user: {
+        id: string;
+        name: string;
+        email: string;
+        phone: string;
+        role: string;
+        area?: string;
+        city?: string;
+    };
+}
+
+export async function login(username: string, password: string): Promise<LoginResponse> {
+    return apiRequest<LoginResponse>('/auth/login', {
+        method: 'POST',
+        body: JSON.stringify({ username, password }),
+    });
+}
+
+export async function signup(userData: {
+    name: string;
+    email: string;
+    phone: string;
+    password: string;
+    role?: string;
+}): Promise<LoginResponse> {
+    return apiRequest<LoginResponse>('/auth/signup', {
+        method: 'POST',
+        body: JSON.stringify(userData),
+    });
+}
+
+// ============ Statistics API ============
+
+export interface Statistics {
+    totalRegistered: number;
+    foundCases: number;
+    activeCases: number;
+    aiMatches: number;
+}
+
+export async function getStatistics(): Promise<Statistics> {
+    return apiRequest<Statistics>('/statistics');
+}
+
+// ============ Cases API ============
+
+export interface Case {
+    id: string;
+    name: string;
+    age: string;
+    status: string;
+    last_seen: string;
+    birth_marks?: string;
+    matched_with?: string;
+    complainant_mobile?: string;
+    submitted_on?: string;
+    photo_url?: string;
+    father_name?: string;
+    address?: string;
+    complainant_name?: string;
+    submitted_by?: string;
+}
+
+export async function getCases(options?: {
+    status?: string;
+    submitted_by?: string;
+    limit?: number;
+}): Promise<Case[]> {
+    const params = new URLSearchParams();
+    if (options?.status) params.append('status', options.status);
+    if (options?.submitted_by) params.append('submitted_by', options.submitted_by);
+    if (options?.limit) params.append('limit', options.limit.toString());
+
+    const query = params.toString() ? `?${params.toString()}` : '';
+    console.log('[API] Fetching cases from:', `/cases${query}`);
+    const result = await apiRequest<Case[]>(`/cases${query}`);
+    console.log('[API] Cases received:', result.length, 'cases');
+    return result;
+}
+
+export async function getCase(caseId: string): Promise<Case> {
+    return apiRequest<Case>(`/cases/${caseId}`);
+}
+
+export async function registerCase(formData: FormData): Promise<Case> {
+    const token = localStorage.getItem('reunite_token');
+
+    const headers: Record<string, string> = {};
+    if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+    }
+
+    const response = await fetch(`${API_BASE}/cases`, {
+        method: 'POST',
+        headers,
+        body: formData,
+    });
+
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({ detail: 'Failed to register case' }));
+        throw new Error(error.detail || `HTTP error ${response.status}`);
+    }
+
+    return response.json();
+}
+
+export async function deleteCase(caseId: string): Promise<{ status: string; id: string }> {
+    return apiRequest(`/cases/${caseId}`, { method: 'DELETE' });
+}
+
+export async function markCaseFound(caseId: string): Promise<{ status: string; id: string; message: string }> {
+    return apiRequest(`/cases/${caseId}/found`, { method: 'PATCH' });
+}
+
+// ============ Public Submissions API ============
+
+export interface PublicSubmission {
+    id: string;
+    status: string;
+    location?: string;
+    mobile?: string;
+    birth_marks?: string;
+    submitted_on?: string;
+    submitted_by?: string;
+    photo_url?: string;
+}
+
+export async function getPublicSubmissions(status?: string): Promise<PublicSubmission[]> {
+    const query = status ? `?status=${status}` : '';
+    return apiRequest<PublicSubmission[]>(`/public${query}`);
+}
+
+export async function getPublicSubmission(id: string): Promise<PublicSubmission> {
+    return apiRequest<PublicSubmission>(`/public/${id}`);
+}
+
+export async function deletePublicSubmission(id: string): Promise<{ status: string; id: string }> {
+    return apiRequest(`/public/${id}`, { method: 'DELETE' });
+}
+
+export async function submitSighting(formData: FormData): Promise<PublicSubmission> {
+    const response = await fetch(`${API_BASE}/public`, {
+        method: 'POST',
+        body: formData,
+    });
+
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({ detail: 'Failed to submit sighting' }));
+        throw new Error(error.detail || `HTTP error ${response.status}`);
+    }
+
+    return response.json();
+}
+
+// ============ Matching API ============
+
+export interface MatchResult {
+    status: boolean;
+    message?: string;
+    result?: Record<string, Array<{
+        public_id: string;
+        distance: number;
+        confidence: number;
+    }>>;
+}
+
+export async function runMatching(tolerance: number = 0.6): Promise<MatchResult> {
+    return apiRequest<MatchResult>(`/matching/run?tolerance=${tolerance}`, {
+        method: 'POST',
+    });
+}
+
+export async function confirmMatch(
+    registeredCaseId: string,
+    publicCaseId: string
+): Promise<{ status: string }> {
+    return apiRequest('/matching/confirm', {
+        method: 'POST',
+        body: JSON.stringify({
+            registered_case_id: registeredCaseId,
+            public_case_id: publicCaseId,
+        }),
+    });
+}
+
+export async function getRecentMatches(): Promise<Case[]> {
+    return apiRequest<Case[]>('/matches');
+}
+
+// ============ Video Analysis API (Phase 2) ============
+
+const API_BASE_V2 = 'http://127.0.0.1:8000/api/v2';
+
+export interface VideoUploadResponse {
+    video_id: string;
+    case_id: string;
+    status: string;
+    message: string;
+}
+
+export interface VideoStatus {
+    video_id: string;
+    status: string;
+    total_frames: number | null;
+    processed_frames: number;
+    total_detections: number;
+    progress_percent: number;
+    error_message: string | null;
+}
+
+export interface Detection {
+    id: string;
+    video_id: string;
+    video_location: string | null;
+    timestamp_seconds: number;
+    timestamp_display: string;
+    confidence: number;
+    cropped_face_url: string;
+    face_thumbnail: string | null;
+    case_id: string;
+    is_low_confidence: boolean;
+    detected_at: string | null;
+}
+
+export interface VideoResults {
+    case_id: string;
+    case_name: string | null;
+    total_videos_analyzed: number;
+    used_fallback: boolean;
+    detections: Detection[];
+}
+
+export async function uploadVideo(formData: FormData): Promise<VideoUploadResponse> {
+    const token = localStorage.getItem('reunite_token');
+    const headers: Record<string, string> = {};
+    if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+    }
+
+    const response = await fetch(`${API_BASE_V2}/video/upload`, {
+        method: 'POST',
+        headers,
+        body: formData,
+    });
+
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({ detail: 'Upload failed' }));
+        throw new Error(error.detail || `HTTP error ${response.status}`);
+    }
+
+    return response.json();
+}
+
+export async function getVideoStatus(videoId: string): Promise<VideoStatus> {
+    const token = localStorage.getItem('reunite_token');
+    const headers: Record<string, string> = {};
+    if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+    }
+
+    const response = await fetch(`${API_BASE_V2}/video/status/${videoId}`, { headers });
+
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({ detail: 'Status check failed' }));
+        throw new Error(error.detail || `HTTP error ${response.status}`);
+    }
+
+    return response.json();
+}
+
+export async function getVideoResults(caseId: string): Promise<VideoResults> {
+    const token = localStorage.getItem('reunite_token');
+    const headers: Record<string, string> = {};
+    if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+    }
+
+    const response = await fetch(`${API_BASE_V2}/video/results/${caseId}`, { headers });
+
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({ detail: 'Results fetch failed' }));
+        throw new Error(error.detail || `HTTP error ${response.status}`);
+    }
+
+    return response.json();
+}
+
+export async function getResultsByVideo(videoId: string): Promise<VideoResults> {
+    const token = localStorage.getItem('reunite_token');
+    const headers: Record<string, string> = {};
+    if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+    }
+
+    const response = await fetch(`${API_BASE_V2}/video/video-results/${videoId}`, { headers });
+
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({ detail: 'Results fetch failed' }));
+        throw new Error(error.detail || `HTTP error ${response.status}`);
+    }
+
+    return response.json();
+}
+
+// ============ Default Export ============
+
+const api = {
+    // Auth
+    login,
+    signup,
+
+    // Statistics
+    getStatistics,
+
+    // Cases
+    getCases,
+    getCase,
+    registerCase,
+    deleteCase,
+    markCaseFound,
+
+    // Public
+    getPublicSubmissions,
+    submitSighting,
+    deletePublicSubmission,
+
+    // Matching
+    runMatching,
+    confirmMatch,
+    getRecentMatches,
+
+    // Video Analysis (Phase 2)
+    uploadVideo,
+    getVideoStatus,
+    getVideoResults,
+};
+
+export default api;
+
+===== END: frontend/src/app/services/api.ts =====
+
+===== FILE: frontend/src/app/pages/dashboard/VideoAnalysis.tsx =====
+import { useState, useEffect, useRef, useCallback } from 'react';
+import {
+    Video, Upload, Search, Clock, MapPin, CheckCircle, AlertCircle,
+    Loader2, ChevronRight, Camera, Shield, X, AlertTriangle
+} from 'lucide-react';
+import {
+    getCases, uploadVideo, getVideoStatus, getVideoResults, getResultsByVideo,
+    type Case, type VideoStatus, type Detection, type VideoResults
+} from '@/app/services/api';
+
+type Phase = 'upload' | 'processing' | 'results';
+
+export default function VideoAnalysis() {
+    // ---- State ----
+    const [phase, setPhase] = useState<Phase>('upload');
+
+    // Upload phase
+    const [cases, setCases] = useState<Case[]>([]);
+    const [loadingCases, setLoadingCases] = useState(true);
+    const [selectedCaseId, setSelectedCaseId] = useState('');
+    const [videoFile, setVideoFile] = useState<File | null>(null);
+    const [videoLocation, setVideoLocation] = useState('');
+    const [confidenceThreshold, setConfidenceThreshold] = useState(0.40);
+    const [uploading, setUploading] = useState(false);
+    const [uploadError, setUploadError] = useState<string | null>(null);
+    const fileInputRef = useRef<HTMLInputElement>(null);
+    const [dragOver, setDragOver] = useState(false);
+
+    // Processing phase
+    const [videoId, setVideoId] = useState<string | null>(null);
+    const [status, setStatus] = useState<VideoStatus | null>(null);
+    const pollRef = useRef<number | null>(null);
+
+    // Results phase
+    const [results, setResults] = useState<VideoResults | null>(null);
+    const [loadingResults, setLoadingResults] = useState(false);
+    const [showFallbackBanner, setShowFallbackBanner] = useState(true);
+
+    // ---- Load cases on mount ----
+    useEffect(() => {
+        async function loadCases() {
+            try {
+                const data = await getCases({ status: 'NF' });
+                setCases(data);
+            } catch (err) {
+                console.error('Failed to load cases:', err);
+            } finally {
+                setLoadingCases(false);
+            }
+        }
+        loadCases();
+    }, []);
+
+    // ---- Cleanup polling on unmount ----
+    useEffect(() => {
+        return () => {
+            if (pollRef.current) {
+                clearInterval(pollRef.current);
+            }
+        };
+    }, []);
+
+    // ---- Poll for processing status ----
+    const startPolling = useCallback((vid: string) => {
+        if (pollRef.current) clearInterval(pollRef.current);
+
+        const poll = async () => {
+            try {
+                const s = await getVideoStatus(vid);
+                setStatus(s);
+
+                if (s.status === 'done') {
+                    if (pollRef.current) clearInterval(pollRef.current);
+                    // Load results
+                    setLoadingResults(true);
+                    try {
+                        const r = await getResultsByVideo(vid);
+                        setResults(r);
+                        setPhase('results');
+                    } catch (err) {
+                        console.error('Failed to load results:', err);
+                    } finally {
+                        setLoadingResults(false);
+                    }
+                } else if (s.status === 'failed') {
+                    if (pollRef.current) clearInterval(pollRef.current);
+                }
+            } catch (err) {
+                console.error('Status poll failed:', err);
+            }
+        };
+
+        poll(); // Immediately
+        pollRef.current = window.setInterval(poll, 3000);
+    }, [selectedCaseId]);
+
+    // ---- Handle upload ----
+    const handleUpload = async () => {
+        if (!videoFile || !selectedCaseId) return;
+
+        setUploading(true);
+        setUploadError(null);
+
+        try {
+            const formData = new FormData();
+            formData.append('video', videoFile);
+            formData.append('case_id', selectedCaseId);
+            formData.append('video_location', videoLocation);
+            formData.append('confidence_threshold', confidenceThreshold.toString());
+
+            const response = await uploadVideo(formData);
+            setVideoId(response.video_id);
+            setPhase('processing');
+            startPolling(response.video_id);
+        } catch (err: unknown) {
+            const errorMsg = err instanceof Error ? err.message : 'Upload failed';
+            setUploadError(errorMsg);
+        } finally {
+            setUploading(false);
+        }
+    };
+
+    // ---- Drag & drop handlers ----
+    const handleDragOver = (e: React.DragEvent) => {
+        e.preventDefault();
+        setDragOver(true);
+    };
+
+    const handleDragLeave = () => setDragOver(false);
+
+    const handleDrop = (e: React.DragEvent) => {
+        e.preventDefault();
+        setDragOver(false);
+        const file = e.dataTransfer.files?.[0];
+        if (file && isValidVideoFile(file)) {
+            setVideoFile(file);
+        }
+    };
+
+    const isValidVideoFile = (file: File) => {
+        const validTypes = ['video/mp4', 'video/avi', 'video/x-msvideo', 'video/x-matroska', 'video/quicktime', 'video/x-ms-wmv'];
+        return validTypes.includes(file.type) || /\.(mp4|avi|mkv|mov|wmv)$/i.test(file.name);
+    };
+
+    const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+        const file = e.target.files?.[0];
+        if (file) setVideoFile(file);
+    };
+
+    const formatFileSize = (bytes: number): string => {
+        if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+        if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+        return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+    };
+
+    const selectedCase = cases.find(c => c.id === selectedCaseId);
+
+    const resetToUpload = () => {
+        setPhase('upload');
+        setVideoFile(null);
+        setVideoId(null);
+        setStatus(null);
+        setResults(null);
+        setUploadError(null);
+        setVideoLocation('');
+        if (pollRef.current) clearInterval(pollRef.current);
+    };
+
+    // =======================================================================
+    // RENDER
+    // =======================================================================
+    return (
+        <div className="space-y-6">
+            {/* Page Header */}
+            <div className="flex items-center justify-between">
+                <div>
+                    <h1 className="text-3xl font-bold mb-1" style={{ color: '#1e1b4b' }}>
+                        CCTV Video Analysis
+                    </h1>
+                    <p className="text-gray-600">
+                        Upload CCTV footage and scan for a missing person using AI
+                    </p>
+                </div>
+                {phase !== 'upload' && (
+                    <button
+                        onClick={resetToUpload}
+                        className="flex items-center gap-2 px-4 py-2 rounded-lg text-white transition-colors hover:opacity-90"
+                        style={{ backgroundColor: '#1e1b4b' }}
+                    >
+                        <Upload className="h-4 w-4" />
+                        New Analysis
+                    </button>
+                )}
+            </div>
+
+            {/* Phase Indicator */}
+            <div className="bg-white rounded-xl p-4 shadow-md border border-gray-200">
+                <div className="flex items-center justify-between">
+                    {[
+                        { key: 'upload', label: 'Upload Video', icon: Upload },
+                        { key: 'processing', label: 'AI Processing', icon: Search },
+                        { key: 'results', label: 'View Results', icon: CheckCircle },
+                    ].map((step, idx) => {
+                        const Icon = step.icon;
+                        const isActive = step.key === phase;
+                        const isDone =
+                            (step.key === 'upload' && (phase === 'processing' || phase === 'results')) ||
+                            (step.key === 'processing' && phase === 'results');
+                        return (
+                            <div key={step.key} className="flex items-center flex-1">
+                                <div className="flex items-center gap-3">
+                                    <div
+                                        className="w-10 h-10 rounded-full flex items-center justify-center transition-all"
+                                        style={{
+                                            backgroundColor: isActive ? '#1e1b4b' : isDone ? '#10b981' : '#e5e7eb',
+                                        }}
+                                    >
+                                        {isDone ? (
+                                            <CheckCircle className="h-5 w-5 text-white" />
+                                        ) : (
+                                            <Icon className={`h-5 w-5 ${isActive ? 'text-white' : 'text-gray-400'}`} />
+                                        )}
+                                    </div>
+                                    <span
+                                        className={`text-sm font-medium hidden sm:block ${isActive ? 'text-gray-900' : isDone ? 'text-green-600' : 'text-gray-400'
+                                            }`}
+                                    >
+                                        {step.label}
+                                    </span>
+                                </div>
+                                {idx < 2 && (
+                                    <div className="flex-1 mx-4">
+                                        <div
+                                            className="h-0.5 rounded"
+                                            style={{ backgroundColor: isDone ? '#10b981' : '#e5e7eb' }}
+                                        />
+                                    </div>
+                                )}
+                            </div>
+                        );
+                    })}
+                </div>
+            </div>
+
+            {/* ============ UPLOAD PHASE ============ */}
+            {phase === 'upload' && (
+                <div className="grid lg:grid-cols-3 gap-6">
+                    {/* Left col: Upload form */}
+                    <div className="lg:col-span-2 space-y-6">
+                        {/* Case selector */}
+                        <div className="bg-white rounded-xl p-6 shadow-md border border-gray-200">
+                            <h2 className="text-lg font-bold mb-4" style={{ color: '#1e1b4b' }}>
+                                1. Select Missing Person Case
+                            </h2>
+                            {loadingCases ? (
+                                <div className="flex items-center gap-2 text-gray-500">
+                                    <Loader2 className="h-5 w-5 animate-spin" />
+                                    Loading cases...
+                                </div>
+                            ) : cases.length === 0 ? (
+                                <div className="p-4 bg-yellow-50 rounded-lg border border-yellow-200 text-yellow-800">
+                                    No active missing cases found. Register a case first.
+                                </div>
+                            ) : (
+                                <select
+                                    id="case-select"
+                                    value={selectedCaseId}
+                                    onChange={(e) => setSelectedCaseId(e.target.value)}
+                                    className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent text-gray-900 bg-white"
+                                >
+                                    <option value="">-- Select a case --</option>
+                                    {cases.map((c) => (
+                                        <option key={c.id} value={c.id}>
+                                            {c.name} — Age: {c.age}, Last seen: {c.last_seen}
+                                        </option>
+                                    ))}
+                                </select>
+                            )}
+
+                            {/* Selected case preview */}
+                            {selectedCase && (
+                                <div className="mt-4 p-4 rounded-lg border border-indigo-200" style={{ backgroundColor: '#f0efff' }}>
+                                    <div className="flex items-center gap-4">
+                                        <div
+                                            className="w-16 h-16 rounded-lg bg-gray-200 flex-shrink-0"
+                                            style={{
+                                                backgroundImage: selectedCase.photo_url
+                                                    ? `url(http://localhost:8000${selectedCase.photo_url})`
+                                                    : 'none',
+                                                backgroundSize: 'cover',
+                                                backgroundPosition: 'center',
+                                            }}
+                                        />
+                                        <div>
+                                            <h3 className="font-bold" style={{ color: '#1e1b4b' }}>{selectedCase.name}</h3>
+                                            <p className="text-sm text-gray-600">Age: {selectedCase.age} | Last seen: {selectedCase.last_seen}</p>
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Video upload */}
+                        <div className="bg-white rounded-xl p-6 shadow-md border border-gray-200">
+                            <h2 className="text-lg font-bold mb-4" style={{ color: '#1e1b4b' }}>
+                                2. Upload CCTV Video
+                            </h2>
+
+                            <div
+                                onDragOver={handleDragOver}
+                                onDragLeave={handleDragLeave}
+                                onDrop={handleDrop}
+                                onClick={() => fileInputRef.current?.click()}
+                                className={`border-2 border-dashed rounded-xl p-8 text-center cursor-pointer transition-all ${dragOver
+                                    ? 'border-indigo-500 bg-indigo-50'
+                                    : videoFile
+                                        ? 'border-green-400 bg-green-50'
+                                        : 'border-gray-300 hover:border-indigo-400 hover:bg-gray-50'
+                                    }`}
+                            >
+                                <input
+                                    ref={fileInputRef}
+                                    type="file"
+                                    accept=".mp4,.avi,.mkv,.mov,.wmv"
+                                    onChange={handleFileSelect}
+                                    className="hidden"
+                                    id="video-file-input"
+                                />
+                                {videoFile ? (
+                                    <div className="space-y-2">
+                                        <Video className="h-12 w-12 mx-auto text-green-500" />
+                                        <p className="font-semibold text-gray-900">{videoFile.name}</p>
+                                        <p className="text-sm text-gray-500">{formatFileSize(videoFile.size)}</p>
+                                        <button
+                                            onClick={(e) => { e.stopPropagation(); setVideoFile(null); }}
+                                            className="inline-flex items-center gap-1 text-sm text-red-500 hover:text-red-700"
+                                        >
+                                            <X className="h-4 w-4" /> Remove
+                                        </button>
+                                    </div>
+                                ) : (
+                                    <div className="space-y-2">
+                                        <Camera className="h-12 w-12 mx-auto text-gray-400" />
+                                        <p className="font-medium text-gray-700">Drag & drop video here, or click to browse</p>
+                                        <p className="text-sm text-gray-500">Supports: MP4, AVI, MKV, MOV, WMV (Max 2 GB)</p>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+
+                        {/* Location & threshold */}
+                        <div className="bg-white rounded-xl p-6 shadow-md border border-gray-200">
+                            <h2 className="text-lg font-bold mb-4" style={{ color: '#1e1b4b' }}>
+                                3. Additional Details
+                            </h2>
+                            <div className="grid sm:grid-cols-2 gap-4">
+                                <div>
+                                    <label htmlFor="video-location" className="block text-sm font-medium text-gray-700 mb-1">
+                                        CCTV Camera Location (Optional)
+                                    </label>
+                                    <input
+                                        id="video-location"
+                                        type="text"
+                                        value={videoLocation}
+                                        onChange={(e) => setVideoLocation(e.target.value)}
+                                        placeholder="e.g. Rajiv Chowk Station Gate 3"
+                                        className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                                    />
+                                </div>
+                                <div>
+                                    <label htmlFor="confidence-threshold" className="block text-sm font-medium text-gray-700 mb-1">
+                                        Distance Threshold: {confidenceThreshold.toFixed(2)} (lower = stricter)
+                                    </label>
+                                    <input
+                                        id="confidence-threshold"
+                                        type="range"
+                                        min="0.20"
+                                        max="0.40"
+                                        step="0.05"
+                                        value={confidenceThreshold}
+                                        onChange={(e) => setConfidenceThreshold(parseFloat(e.target.value))}
+                                        className="w-full mt-2"
+                                    />
+                                    <div className="flex justify-between text-xs text-gray-400 mt-1">
+                                        <span>Stricter (0.20)</span>
+                                        <span>More results (0.40)</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* Upload error */}
+                        {uploadError && (
+                            <div className="p-4 bg-red-50 rounded-xl border border-red-200 flex items-start gap-3">
+                                <AlertCircle className="h-5 w-5 text-red-500 mt-0.5 flex-shrink-0" />
+                                <div>
+                                    <p className="font-medium text-red-800">Upload Failed</p>
+                                    <p className="text-sm text-red-600">{uploadError}</p>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Submit button */}
+                        <button
+                            id="start-analysis-btn"
+                            onClick={handleUpload}
+                            disabled={!selectedCaseId || !videoFile || uploading}
+                            className="w-full py-4 rounded-xl text-white font-bold text-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed hover:opacity-90"
+                            style={{ backgroundColor: '#1e1b4b' }}
+                        >
+                            {uploading ? (
+                                <span className="flex items-center justify-center gap-2">
+                                    <Loader2 className="h-5 w-5 animate-spin" />
+                                    Uploading...
+                                </span>
+                            ) : (
+                                <span className="flex items-center justify-center gap-2">
+                                    <Shield className="h-5 w-5" />
+                                    Start AI Analysis
+                                </span>
+                            )}
+                        </button>
+                    </div>
+
+                    {/* Right col: Info panel */}
+                    <div className="space-y-6">
+                        <div className="bg-gradient-to-br from-indigo-950 to-indigo-800 rounded-xl p-6 text-white">
+                            <h3 className="text-lg font-bold mb-4 flex items-center gap-2">
+                                <Video className="h-5 w-5" />
+                                How It Works
+                            </h3>
+                            <div className="space-y-4 text-sm">
+                                {[
+                                    'Select a missing person case to search for',
+                                    'Upload CCTV footage (up to 15 minutes)',
+                                    'AI extracts frames every 2 seconds',
+                                    'RetinaFace detects all faces in each frame',
+                                    'ArcFace compares against the missing person',
+                                    'Matching faces are flagged with timestamps',
+                                ].map((step, i) => (
+                                    <div key={i} className="flex items-start gap-3">
+                                        <span className="w-6 h-6 rounded-full bg-white/20 flex items-center justify-center flex-shrink-0 text-xs font-bold">
+                                            {i + 1}
+                                        </span>
+                                        <span className="text-indigo-100">{step}</span>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+
+                        <div className="bg-white rounded-xl p-6 shadow-md border border-gray-200">
+                            <h3 className="text-lg font-bold mb-3" style={{ color: '#1e1b4b' }}>
+                                Performance
+                            </h3>
+                            <div className="space-y-3 text-sm text-gray-600">
+                                <div className="flex justify-between">
+                                    <span>15-min video</span>
+                                    <span className="font-medium text-gray-900">~450 frames</span>
+                                </div>
+                                <div className="flex justify-between">
+                                    <span>GPU processing</span>
+                                    <span className="font-medium text-gray-900">~15 min</span>
+                                </div>
+                                <div className="flex justify-between">
+                                    <span>CPU fallback</span>
+                                    <span className="font-medium text-gray-900">~45 min</span>
+                                </div>
+                                <div className="flex justify-between">
+                                    <span>Workload saved</span>
+                                    <span className="font-bold text-green-600">92%</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* ============ PROCESSING PHASE ============ */}
+            {phase === 'processing' && status && (
+                <div className="max-w-2xl mx-auto space-y-6">
+                    <div className="bg-white rounded-xl p-8 shadow-lg border border-gray-200 text-center">
+                        {status.status === 'failed' ? (
+                            <>
+                                <AlertCircle className="h-16 w-16 mx-auto mb-4 text-red-500" />
+                                <h2 className="text-2xl font-bold text-red-600 mb-2">Processing Failed</h2>
+                                <p className="text-gray-600 mb-4">{status.error_message || 'An unexpected error occurred'}</p>
+                                <button
+                                    onClick={resetToUpload}
+                                    className="px-6 py-3 rounded-lg text-white font-medium hover:opacity-90"
+                                    style={{ backgroundColor: '#1e1b4b' }}
+                                >
+                                    Try Again
+                                </button>
+                            </>
+                        ) : (
+                            <>
+                                <Loader2 className="h-16 w-16 mx-auto mb-4 animate-spin" style={{ color: '#1e1b4b' }} />
+                                <h2 className="text-2xl font-bold mb-2" style={{ color: '#1e1b4b' }}>
+                                    {status.status === 'queued' ? 'Preparing Analysis...' : 'Analyzing Video...'}
+                                </h2>
+                                <p className="text-gray-600 mb-6">
+                                    AI is scanning each frame for the selected missing person
+                                </p>
+
+                                {/* Progress bar */}
+                                <div className="w-full bg-gray-200 rounded-full h-4 mb-4 overflow-hidden">
+                                    <div
+                                        className="h-4 rounded-full transition-all duration-500 ease-out"
+                                        style={{
+                                            width: `${status.total_frames > 0 ? Math.min(100, Math.round((status.processed_frames / status.total_frames) * 100)) : 0}%`,
+                                            background: 'linear-gradient(90deg, #1e1b4b 0%, #4338ca 100%)',
+                                        }}
+                                    />
+                                </div>
+
+                                <div className="grid grid-cols-3 gap-4 text-center">
+                                    <div>
+                                        <p className="text-2xl font-bold" style={{ color: '#1e1b4b' }}>
+                                            {status.total_frames && status.total_frames > 0 ? Math.min(100, Math.round((status.processed_frames / status.total_frames) * 100)) : 0}%
+                                        </p>
+                                        <p className="text-xs text-gray-500">Progress</p>
+                                    </div>
+                                    <div>
+                                        <p className="text-2xl font-bold" style={{ color: '#1e1b4b' }}>
+                                            {status.processed_frames}/{status.total_frames || '?'}
+                                        </p>
+                                        <p className="text-xs text-gray-500">Frames</p>
+                                    </div>
+                                    <div>
+                                        <p className="text-2xl font-bold" style={{ color: status.total_detections > 0 ? '#10b981' : '#1e1b4b' }}>
+                                            {status.total_detections}
+                                        </p>
+                                        <p className="text-xs text-gray-500">Detections</p>
+                                    </div>
+                                </div>
+                            </>
+                        )}
+                    </div>
+
+                    {/* Tips while processing */}
+                    {status.status !== 'failed' && (
+                        <div className="bg-indigo-50 rounded-xl p-6 border border-indigo-200">
+                            <h3 className="font-bold text-indigo-900 mb-2">While you wait...</h3>
+                            <ul className="text-sm text-indigo-800 space-y-1">
+                                <li className="flex items-center gap-2">
+                                    <ChevronRight className="h-4 w-4 flex-shrink-0" />
+                                    Processing runs in the background — you can navigate away
+                                </li>
+                                <li className="flex items-center gap-2">
+                                    <ChevronRight className="h-4 w-4 flex-shrink-0" />
+                                    Each frame is analyzed for faces and compared against the case
+                                </li>
+                                <li className="flex items-center gap-2">
+                                    <ChevronRight className="h-4 w-4 flex-shrink-0" />
+                                    Detections above the threshold are saved automatically
+                                </li>
+                            </ul>
+                        </div>
+                    )}
+                </div>
+            )}
+
+            {/* ============ RESULTS PHASE ============ */}
+            {phase === 'results' && (
+                <div className="space-y-6">
+                    {loadingResults ? (
+                        <div className="flex items-center justify-center min-h-[300px]">
+                            <Loader2 className="h-10 w-10 animate-spin" style={{ color: '#1e1b4b' }} />
+                        </div>
+                    ) : results ? (
+                        <>
+                            {/* Fallback warning banner */}
+                            {results.used_fallback && showFallbackBanner && (
+                                <div
+                                    className="flex items-center justify-between p-4 rounded-xl border"
+                                    style={{ backgroundColor: '#fef3c7', borderColor: '#f59e0b' }}
+                                >
+                                    <div className="flex items-center gap-3">
+                                        <AlertTriangle className="h-5 w-5 flex-shrink-0" style={{ color: '#d97706' }} />
+                                        <p className="text-sm font-medium" style={{ color: '#92400e' }}>
+                                            ⚠️ No high-confidence matches found. Showing low-confidence detections for review.
+                                        </p>
+                                    </div>
+                                    <button
+                                        onClick={() => setShowFallbackBanner(false)}
+                                        className="p-1 rounded-lg hover:bg-yellow-200 transition-colors"
+                                        aria-label="Dismiss fallback banner"
+                                    >
+                                        <X className="h-4 w-4" style={{ color: '#92400e' }} />
+                                    </button>
+                                </div>
+                            )}
+                            {/* Summary card */}
+                            <div className="bg-white rounded-xl p-6 shadow-md border border-gray-200">
+                                <div className="grid sm:grid-cols-3 gap-6">
+                                    <div className="text-center">
+                                        <p className="text-4xl font-bold" style={{ color: '#1e1b4b' }}>
+                                            {results.detections.length}
+                                        </p>
+                                        <p className="text-sm text-gray-600 mt-1">Potential Sightings</p>
+                                    </div>
+                                    <div className="text-center">
+                                        <p className="text-4xl font-bold" style={{ color: '#10b981' }}>
+                                            {results.detections.filter(d => d.confidence >= 60).length}
+                                        </p>
+                                        <p className="text-sm text-gray-600 mt-1">Higher Confidence (≥60%)</p>
+                                    </div>
+                                    <div className="text-center">
+                                        <p className="text-4xl font-bold" style={{ color: '#f59e0b' }}>
+                                            {results.total_videos_analyzed}
+                                        </p>
+                                        <p className="text-sm text-gray-600 mt-1">Videos Analyzed</p>
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* No detections message */}
+                            {results.detections.length === 0 ? (
+                                <div className="bg-white rounded-xl p-12 shadow-md border border-gray-200 text-center">
+                                    <Search className="h-16 w-16 mx-auto mb-4 text-gray-300" />
+                                    <h3 className="text-xl font-bold text-gray-700 mb-2">
+                                        No Matches Found
+                                    </h3>
+                                    <p className="text-gray-500 max-w-md mx-auto">
+                                        The AI did not detect the missing person in this video at the given confidence threshold.
+                                        Try uploading videos from different camera angles or lowering the threshold.
+                                    </p>
+                                </div>
+                            ) : (
+                                /* Detection cards */
+                                <div className="space-y-4">
+                                    <h2 className="text-xl font-bold" style={{ color: '#1e1b4b' }}>
+                                        Detection Timeline
+                                        {results.case_name && (
+                                            <span className="text-base font-normal text-gray-500 ml-2">
+                                                for {results.case_name}
+                                            </span>
+                                        )}
+                                    </h2>
+
+                                    <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                                        {results.detections.map((det, idx) => (
+                                            <div
+                                                key={det.id}
+                                                className="bg-white rounded-xl shadow-md border border-gray-200 overflow-hidden hover:shadow-lg transition-shadow"
+                                            >
+                                                {/* Cropped face image */}
+                                                <div className="relative" style={{ height: '180px', backgroundColor: '#f3f4f6' }}>
+                                                    <img
+                                                        src={det.face_thumbnail
+                                                            ? `data:image/jpeg;base64,${det.face_thumbnail}`
+                                                            : undefined}
+                                                        alt="Detection"
+                                                        style={{ width: '100%', height: '100%', objectFit: 'cover', display: det.face_thumbnail ? 'block' : 'none' }}
+                                                    />
+                                                    {!det.face_thumbnail && (
+                                                        <div style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '8px' }}>
+                                                            <div style={{ width: '56px', height: '56px', borderRadius: '50%', backgroundColor: '#d1d5db', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                                                                <Camera className="h-7 w-7" style={{ color: '#9ca3af' }} />
+                                                            </div>
+                                                            <span style={{ fontSize: '11px', color: '#9ca3af', fontWeight: 500 }}>No image</span>
+                                                        </div>
+                                                    )}
+                                                    {/* Confidence badge */}
+                                                    <div
+                                                        className="absolute top-3 right-3 px-3 py-1 rounded-full text-sm font-bold text-white"
+                                                        style={{
+                                                            backgroundColor: det.is_low_confidence
+                                                                ? '#f59e0b'
+                                                                : det.confidence >= 80
+                                                                    ? '#10b981'
+                                                                    : det.confidence >= 60
+                                                                        ? '#f59e0b'
+                                                                        : '#ef4444',
+                                                        }}
+                                                    >
+                                                        {det.confidence.toFixed(1)}%
+                                                    </div>
+                                                    {/* Low confidence label */}
+                                                    {det.is_low_confidence && (
+                                                        <div
+                                                            className="absolute bottom-3 left-3 right-3 px-2 py-1 rounded-lg text-xs font-bold text-center"
+                                                            style={{ backgroundColor: '#fef3c7', color: '#92400e' }}
+                                                        >
+                                                            Low Confidence — Needs Review
+                                                        </div>
+                                                    )}
+                                                    <div className="absolute top-3 left-3 px-2 py-1 rounded-lg bg-black/60 text-white text-xs font-mono">
+                                                        #{idx + 1}
+                                                    </div>
+                                                </div>
+
+                                                <div className="p-4 space-y-2">
+                                                    <div className="flex items-center gap-2 text-sm">
+                                                        <Clock className="h-4 w-4 text-gray-400" />
+                                                        <span className="font-mono font-bold" style={{ color: '#1e1b4b' }}>
+                                                            {det.timestamp_display}
+                                                        </span>
+                                                        <span className="text-gray-400">
+                                                            ({det.timestamp_seconds.toFixed(1)}s)
+                                                        </span>
+                                                    </div>
+
+                                                    {det.video_location && (
+                                                        <div className="flex items-center gap-2 text-sm text-gray-600">
+                                                            <MapPin className="h-4 w-4 text-gray-400 flex-shrink-0" />
+                                                            <span className="truncate">{det.video_location}</span>
+                                                        </div>
+                                                    )}
+
+                                                    {det.detected_at && (
+                                                        <div className="text-xs text-gray-400">
+                                                            Detected: {new Date(det.detected_at).toLocaleString()}
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
+                        </>
+                    ) : (
+                        <div className="bg-red-50 rounded-xl p-6 border border-red-200 text-center">
+                            <p className="text-red-600">Failed to load results. Please try again.</p>
+                        </div>
+                    )}
+                </div>
+            )}
+        </div>
+    );
+}
+
+===== END: frontend/src/app/pages/dashboard/VideoAnalysis.tsx =====

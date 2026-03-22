@@ -56,6 +56,8 @@ class DetectionItem(BaseModel):
     timestamp_display: str
     confidence: float
     cropped_face_url: str
+    face_thumbnail: Optional[str] = None
+    case_id: str = ""
     is_low_confidence: bool = False
     detected_at: Optional[datetime] = None
 
@@ -189,6 +191,52 @@ async def get_video_status(video_id: str):
     )
 
 
+@router.get("/video-results/{video_id}", response_model=VideoResultsResponse)
+async def get_results_by_video(video_id: str):
+    """
+    Fetch all detection results for a specific video upload.
+    Returns detections regardless of which case_id they matched.
+    """
+    upload = db_queries.get_video_upload(video_id)
+    if not upload:
+        raise HTTPException(status_code=404, detail="Video upload not found.")
+
+    case_id = upload.case_id
+    case_detail = db_queries.get_registered_case_detail(case_id)
+    case_name = None
+    if case_detail and len(case_detail) > 0:
+        case_name = case_detail[0][0] if isinstance(case_detail[0], tuple) else None
+
+    detections = db_queries.get_video_detections_by_video(video_id)
+
+    detection_items = []
+    for det in (detections or []):
+        detection_items.append(DetectionItem(
+            id=det.id,
+            video_id=det.video_id,
+            video_location=upload.video_location,
+            timestamp_seconds=det.timestamp_seconds,
+            timestamp_display=_format_timestamp(det.timestamp_seconds),
+            confidence=det.confidence,
+            cropped_face_url=f"/resources/{det.cropped_face_path}" if det.cropped_face_path else "",
+            face_thumbnail=getattr(det, 'face_thumbnail', None),
+            case_id=det.case_id,
+            is_low_confidence=getattr(det, 'is_low_confidence', False),
+            detected_at=det.detected_at,
+        ))
+
+    all_uploads_for_case = db_queries.get_video_uploads_by_case(case_id)
+    total_analyzed = len(all_uploads_for_case) if all_uploads_for_case else 1
+
+    return VideoResultsResponse(
+        case_id=case_id,
+        case_name=case_name,
+        total_videos_analyzed=total_analyzed,
+        used_fallback=getattr(upload, 'used_fallback', False),
+        detections=detection_items,
+    )
+
+
 @router.get("/results/{case_id}", response_model=VideoResultsResponse)
 async def get_video_results(case_id: str):
     """
@@ -222,7 +270,9 @@ async def get_video_results(case_id: str):
             timestamp_seconds=det.timestamp_seconds,
             timestamp_display=_format_timestamp(det.timestamp_seconds),
             confidence=det.confidence,
-            cropped_face_url=f"/resources/{det.cropped_face_path}",
+            cropped_face_url=f"/resources/{det.cropped_face_path}" if det.cropped_face_path else "",
+            face_thumbnail=getattr(det, 'face_thumbnail', None),
+            case_id=det.case_id,
             is_low_confidence=getattr(det, 'is_low_confidence', False),
             detected_at=det.detected_at,
         ))

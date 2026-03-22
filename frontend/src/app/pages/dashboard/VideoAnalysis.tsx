@@ -4,7 +4,7 @@ import {
     Loader2, ChevronRight, Camera, Shield, X, AlertTriangle
 } from 'lucide-react';
 import {
-    getCases, uploadVideo, getVideoStatus, getVideoResults,
+    getCases, uploadVideo, getVideoStatus, getVideoResults, getResultsByVideo,
     type Case, type VideoStatus, type Detection, type VideoResults
 } from '@/app/services/api';
 
@@ -74,7 +74,7 @@ export default function VideoAnalysis() {
                     // Load results
                     setLoadingResults(true);
                     try {
-                        const r = await getVideoResults(selectedCaseId || s.video_id);
+                        const r = await getResultsByVideo(vid);
                         setResults(r);
                         setPhase('results');
                     } catch (err) {
@@ -507,7 +507,7 @@ export default function VideoAnalysis() {
                                     <div
                                         className="h-4 rounded-full transition-all duration-500 ease-out"
                                         style={{
-                                            width: `${Math.max(status.progress_percent, 2)}%`,
+                                            width: `${status.total_frames > 0 ? Math.min(100, Math.round((status.processed_frames / status.total_frames) * 100)) : 0}%`,
                                             background: 'linear-gradient(90deg, #1e1b4b 0%, #4338ca 100%)',
                                         }}
                                     />
@@ -516,7 +516,7 @@ export default function VideoAnalysis() {
                                 <div className="grid grid-cols-3 gap-4 text-center">
                                     <div>
                                         <p className="text-2xl font-bold" style={{ color: '#1e1b4b' }}>
-                                            {status.progress_percent.toFixed(1)}%
+                                            {status.total_frames && status.total_frames > 0 ? Math.min(100, Math.round((status.processed_frames / status.total_frames) * 100)) : 0}%
                                         </p>
                                         <p className="text-xs text-gray-500">Progress</p>
                                     </div>
@@ -645,16 +645,22 @@ export default function VideoAnalysis() {
                                                 className="bg-white rounded-xl shadow-md border border-gray-200 overflow-hidden hover:shadow-lg transition-shadow"
                                             >
                                                 {/* Cropped face image */}
-                                                <div className="relative">
+                                                <div className="relative" style={{ height: '180px', backgroundColor: '#f3f4f6' }}>
                                                     <img
-                                                        src={`http://127.0.0.1:8000${det.cropped_face_url}`}
-                                                        alt={`Detection ${idx + 1}`}
-                                                        className="w-full h-48 object-cover bg-gray-100"
-                                                        onError={(e) => {
-                                                            (e.target as HTMLImageElement).src = '';
-                                                            (e.target as HTMLImageElement).className = 'w-full h-48 bg-gray-200 flex items-center justify-center';
-                                                        }}
+                                                        src={det.face_thumbnail
+                                                            ? `data:image/jpeg;base64,${det.face_thumbnail}`
+                                                            : undefined}
+                                                        alt="Detection"
+                                                        style={{ width: '100%', height: '100%', objectFit: 'cover', display: det.face_thumbnail ? 'block' : 'none' }}
                                                     />
+                                                    {!det.face_thumbnail && (
+                                                        <div style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '8px' }}>
+                                                            <div style={{ width: '56px', height: '56px', borderRadius: '50%', backgroundColor: '#d1d5db', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                                                                <Camera className="h-7 w-7" style={{ color: '#9ca3af' }} />
+                                                            </div>
+                                                            <span style={{ fontSize: '11px', color: '#9ca3af', fontWeight: 500 }}>No image</span>
+                                                        </div>
+                                                    )}
                                                     {/* Confidence badge */}
                                                     <div
                                                         className="absolute top-3 right-3 px-3 py-1 rounded-full text-sm font-bold text-white"

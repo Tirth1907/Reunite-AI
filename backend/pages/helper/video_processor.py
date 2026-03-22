@@ -15,6 +15,7 @@ Designed for:
 """
 
 import os
+import base64
 import json
 import uuid
 import logging
@@ -42,6 +43,7 @@ from pages.helper.yolo_prescreener import (
     has_face_yolo,
     is_yolo_available,
 )
+
 
 # ============================================================
 # SPEED-CRITICAL FILE — READ BEFORE MODIFYING
@@ -86,6 +88,11 @@ from pages.helper.yolo_prescreener import (
 # ---------------------------------------------------------------------------
 logger = logging.getLogger(__name__)
 
+# Haar cascade pre-filter for fast face detection
+_HAAR_CASCADE = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+)
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -104,11 +111,8 @@ MAX_VIDEO_SIZE_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 # Directories
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 VIDEO_UPLOADS_DIR = os.path.join(BASE_DIR, "video_uploads")
-DETECTIONS_DIR = os.path.join(BASE_DIR, "resources", "video_detections")
-
 # Ensure directories exist
 os.makedirs(VIDEO_UPLOADS_DIR, exist_ok=True)
-os.makedirs(DETECTIONS_DIR, exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # GPU / CPU Detection
@@ -180,38 +184,6 @@ def _ensure_deepface():
 # Core helpers
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Haar cascade pre-filter (lightweight face check ~3-5ms per frame)
-# ---------------------------------------------------------------------------
-_haar_cascade = None
-
-
-def _get_haar_cascade():
-    """Lazy-load the OpenCV Haar cascade for fast face pre-filtering."""
-    global _haar_cascade
-    if _haar_cascade is None:
-        cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        _haar_cascade = cv2.CascadeClassifier(cascade_path)
-    return _haar_cascade
-
-
-def _has_faces_fast(frame_bgr):
-    """
-    Lightweight pre-filter using OpenCV Haar cascade.
-    Returns True if at least one face-like region is detected.
-    Runs in ~3-5ms, used to skip expensive DeepFace on empty frames.
-    """
-    cascade = _get_haar_cascade()
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    faces = cascade.detectMultiScale(
-        gray,
-        scaleFactor=1.1,
-        minNeighbors=5,
-        minSize=(60, 60),
-        flags=cv2.CASCADE_SCALE_IMAGE,
-    )
-    return len(faces) > 0
-
 
 def _cosine_distance(a, b):
     """Cosine distance between two vectors. Returns 0.0 (identical) to 2.0."""
@@ -223,6 +195,20 @@ def _cosine_distance(a, b):
         return 1.0
     return 1.0 - (np.dot(a, b) / (norm_a * norm_b))
 
+
+def _has_faces_fast(frame_rgb):
+    """Haar cascade pre-filter. Returns list of box dicts, empty list if none."""
+    gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
+    faces = _HAAR_CASCADE.detectMultiScale(
+        gray,
+        scaleFactor=1.1,
+        minNeighbors=5,
+        minSize=(60, 60),
+    )
+    if len(faces) == 0:
+        return []
+    return [{"x1": int(x), "y1": int(y), "x2": int(x + w), "y2": int(y + h)}
+            for (x, y, w, h) in faces]
 
 def _detect_and_embed(frame_rgb, is_fallback_pass=False, yolo_boxes=None):
     """
@@ -260,7 +246,14 @@ def _detect_and_embed(frame_rgb, is_fallback_pass=False, yolo_boxes=None):
                     embedding = results[0].get("embedding")
                     if embedding:
                         facial_area = {"x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1}
-                        faces.append((embedding, facial_area))
+                        try:
+                            face_crop_bgr = cv2.cvtColor(face_crop, cv2.COLOR_RGB2BGR)
+                            face_crop_bgr = cv2.resize(face_crop_bgr, (160, 160))
+                            _, buffer = cv2.imencode(".jpg", face_crop_bgr)
+                            yolo_face_b64 = base64.b64encode(buffer).decode("utf-8")
+                        except Exception:
+                            yolo_face_b64 = None
+                        faces.append((embedding, facial_area, yolo_face_b64))
             except Exception:
                 continue
         return faces
@@ -283,10 +276,27 @@ def _detect_and_embed(frame_rgb, is_fallback_pass=False, yolo_boxes=None):
             if embedding and face_confidence >= 0.50:
                 face_w = facial_area.get("w", 0)
                 face_h = facial_area.get("h", 0)
+                # Generate base64 thumbnail from facial area
+                try:
+                    fx = max(0, facial_area.get("x", 0))
+                    fy = max(0, facial_area.get("y", 0))
+                    fw = facial_area.get("w", 0)
+                    fh = facial_area.get("h", 0)
+                    if fw > 0 and fh > 0:
+                        face_crop = frame_rgb[fy:fy+fh, fx:fx+fw]
+                        face_crop_bgr = cv2.cvtColor(face_crop, cv2.COLOR_RGB2BGR)
+                        face_crop_bgr = cv2.resize(face_crop_bgr, (160, 160))
+                        _, buffer = cv2.imencode(".jpg", face_crop_bgr)
+                        face_b64 = base64.b64encode(buffer).decode("utf-8")
+                    else:
+                        face_b64 = None
+                except Exception:
+                    face_b64 = None
                 if face_w >= 30 and face_h >= 30:
-                    faces.append((embedding, facial_area))
+                    faces.append((embedding, facial_area, face_b64))
         return faces
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[VIDEO] _detect_and_embed failed: {e}")
         return []
 
 
@@ -305,14 +315,7 @@ def _crop_face(frame_rgb, facial_area, padding=20):
     return cropped
 
 
-def _save_cropped_face(cropped_rgb, detection_id):
-    """Save a cropped face image as JPEG. Returns the relative path."""
-    filename = f"{detection_id}.jpg"
-    filepath = os.path.join(DETECTIONS_DIR, filename)
-    # Convert RGB to BGR for OpenCV saving
-    cropped_bgr = cv2.cvtColor(cropped_rgb, cv2.COLOR_RGB2BGR)
-    cv2.imwrite(filepath, cropped_bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
-    return f"video_detections/{filename}"
+
 
 
 # ---------------------------------------------------------------------------
@@ -381,9 +384,8 @@ def get_adaptive_frame_interval(duration_seconds: float, is_fallback_pass: bool 
 
 def _run_processing_pass(
     video_path: str,
-    case_embedding,
+    all_case_embeddings: list,
     video_id: str,
-    case_id: str,
     confidence_threshold: float,
     min_confidence_percent: int,
     is_fallback_pass: bool = False,
@@ -486,11 +488,10 @@ def _run_processing_pass(
                     continue
             else:
                 # Use YOLO pre-screener first (faster, ~15ms), fall back to Haar
-                face_detected = False
-                yolo_boxes = None
-                face_detected = _has_faces_fast(frame_bgr)
+                frame_rgb_pre = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                haar_boxes = _has_faces_fast(frame_rgb_pre)
 
-                if not face_detected:
+                if not haar_boxes:
                     skipped_no_face += 1
                     processed += 1
                     del frame_bgr
@@ -503,8 +504,13 @@ def _run_processing_pass(
                         )
                     continue
 
-            # Convert BGR -> RGB for DeepFace
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                # Convert BGR -> RGB for DeepFace (Pass 1 only)
+                frame_rgb = frame_rgb_pre
+                yolo_boxes = haar_boxes
+
+            # For fallback pass, frame_rgb_pre was never assigned above — convert here
+            if is_fallback_pass:
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
             # Detect faces and get embeddings
             if is_fallback_pass:
@@ -521,45 +527,55 @@ def _run_processing_pass(
                         continue
                     if np.linalg.norm(embedding) <= FALLBACK_MIN_EMBEDDING_NORM:
                         continue
-                    faces.append((embedding, facial_area))
+                    try:
+                        fx = max(0, facial_area.get("x", 0))
+                        fy = max(0, facial_area.get("y", 0))
+                        fw = facial_area.get("w", 0)
+                        fh = facial_area.get("h", 0)
+                        if fw > 0 and fh > 0:
+                            fb_crop = frame_rgb[fy:fy+fh, fx:fx+fw]
+                            fb_bgr = cv2.cvtColor(fb_crop, cv2.COLOR_RGB2BGR)
+                            fb_bgr = cv2.resize(fb_bgr, (160, 160))
+                            _, fb_buf = cv2.imencode(".jpg", fb_bgr)
+                            fb_b64 = base64.b64encode(fb_buf).decode("utf-8")
+                        else:
+                            fb_b64 = None
+                    except Exception:
+                        fb_b64 = None
+                    faces.append((embedding, facial_area, fb_b64))
             else:
-                faces = _detect_and_embed(frame_rgb, is_fallback_pass=False)
 
-            # ---- Rule 1: Only process the BEST face match per frame ----
-            best_frame_match = None  # (distance, confidence, embedding_arr, facial_area)
+                faces = _detect_and_embed(frame_rgb, is_fallback_pass=False, yolo_boxes=yolo_boxes)
 
-            for embedding, facial_area in faces:
+            # ---- Rule 1: Best match per face across ALL registered cases ----
+            best_frame_match = None  # (distance, confidence, embedding_arr, facial_area, face_b64, matched_case_id)
+
+            for embedding, facial_area, face_b64 in faces:
                 embedding_arr = np.array(embedding, dtype=np.float64)
 
-                if len(embedding_arr) != len(case_embedding):
-                    continue
+                for case_entry in all_case_embeddings:
+                    case_embedding = case_entry["embedding"]
+                    matched_case_id = case_entry["case_id"]
 
-                distance = _cosine_distance(case_embedding, embedding_arr)
-                confidence = (1.0 - distance) * 100.0
+                    if len(embedding_arr) != len(case_embedding):
+                        continue
 
-                if is_fallback_pass:
-                    if (distance <= FALLBACK_DISTANCE_THRESHOLD and
-                            confidence >= FALLBACK_MIN_CONFIDENCE):
-                        if best_frame_match is None or confidence > best_frame_match[1]:
-                            best_frame_match = (distance, confidence, embedding_arr, facial_area)
+                    distance = _cosine_distance(case_embedding, embedding_arr)
+                    confidence = (1.0 - distance) * 100.0
+
+                    if is_fallback_pass:
+                        if (distance <= FALLBACK_DISTANCE_THRESHOLD and
+                                confidence >= FALLBACK_MIN_CONFIDENCE):
+                            if best_frame_match is None or confidence > best_frame_match[1]:
+                                best_frame_match = (distance, confidence, embedding_arr, facial_area, face_b64, matched_case_id)
                     else:
-                        logger.info(
-                            f"[FILTER] [{pass_label}] Rejected at {timestamp_sec:.1f}s, "
-                            f"conf={confidence:.1f}%, dist={distance:.4f}"
-                        )
-                else:
-                    if distance <= confidence_threshold and confidence >= min_confidence_percent:
-                        if best_frame_match is None or confidence > best_frame_match[1]:
-                            best_frame_match = (distance, confidence, embedding_arr, facial_area)
-                    else:
-                        logger.info(
-                            f"[FILTER] [{pass_label}] Rejected at {timestamp_sec:.1f}s, "
-                            f"conf={confidence:.1f}%, dist={distance:.4f}"
-                        )
+                        if distance <= confidence_threshold and confidence >= min_confidence_percent:
+                            if best_frame_match is None or confidence > best_frame_match[1]:
+                                best_frame_match = (distance, confidence, embedding_arr, facial_area, face_b64, matched_case_id)
 
             # ---- Rule 2: Suppress consecutive similar detections ----
             if best_frame_match is not None:
-                _, confidence, embedding_arr, facial_area = best_frame_match
+                _, confidence, embedding_arr, facial_area, face_b64, matched_case_id = best_frame_match
 
                 suppressed = False
                 time_gap = timestamp_sec - last_saved_timestamp
@@ -576,19 +592,15 @@ def _run_processing_pass(
                 if not suppressed:
                     # Save this detection
                     detection_id = str(uuid.uuid4())
-                    cropped = _crop_face(frame_rgb, facial_area)
-                    if cropped is not None and cropped.size > 0:
-                        cropped_path = _save_cropped_face(cropped, detection_id)
-                    else:
-                        cropped_path = _save_cropped_face(frame_rgb, detection_id)
 
                     detection = VideoDetections(
                         id=detection_id,
                         video_id=video_id,
-                        case_id=case_id,
+                        case_id=matched_case_id,
                         timestamp_seconds=round(timestamp_sec, 2),
                         confidence=round(confidence, 2),
-                        cropped_face_path=cropped_path,
+                        cropped_face_path=None,
+                        face_thumbnail=face_b64,
                         frame_number=frame_idx,
                         is_low_confidence=is_fallback_pass,
                     )
@@ -692,18 +704,41 @@ def process_video(video_id: str):
         target_embedding = np.array(target_embedding, dtype=np.float64)
         logger.info(f"[VIDEO] Target embedding loaded: case={case_id}, dim={len(target_embedding)}")
 
+        # Load ALL registered NF case embeddings for multi-case scanning
+        from sqlmodel import Session, select
+        from pages.helper.data_models import RegisteredCases
+        from pages.helper.db_queries import engine
+        all_case_embeddings = []
+        with Session(engine) as session:
+            rows = session.exec(
+                select(RegisteredCases.id, RegisteredCases.face_mesh)
+                .where(RegisteredCases.status == "NF")
+            ).all()
+        for row_id, row_mesh in rows:
+            try:
+                emb = json.loads(row_mesh)
+                if emb and len(emb) > 0:
+                    all_case_embeddings.append({
+                        "case_id": row_id,
+                        "embedding": np.array(emb, dtype=np.float64),
+                    })
+            except Exception:
+                continue
+        if not all_case_embeddings:
+            raise ValueError("No registered NF cases with valid embeddings found")
+        logger.info(f"[VIDEO] Loaded {len(all_case_embeddings)} NF case embeddings for scanning")
+
         # ---- Ensure DeepFace is ready ----
         if not _ensure_deepface():
             raise RuntimeError("DeepFace is not available. Install with: pip install deepface")
 
         # ==================================================================
-        # PASS 1 — Strict thresholds (existing logic, completely unchanged)
+        # PASS 1 — Strict thresholds
         # ==================================================================
         pass1_count = _run_processing_pass(
             video_path=file_path,
-            case_embedding=target_embedding,
+            all_case_embeddings=all_case_embeddings,
             video_id=video_id,
-            case_id=case_id,
             confidence_threshold=threshold,
             min_confidence_percent=MIN_CONFIDENCE_PERCENT,
             is_fallback_pass=False,
@@ -724,9 +759,8 @@ def process_video(video_id: str):
 
             pass2_count = _run_processing_pass(
                 video_path=file_path,
-                case_embedding=target_embedding,
+                all_case_embeddings=all_case_embeddings,
                 video_id=video_id,
-                case_id=case_id,
                 confidence_threshold=FALLBACK_DISTANCE_THRESHOLD,
                 min_confidence_percent=FALLBACK_MIN_CONFIDENCE,
                 is_fallback_pass=True,

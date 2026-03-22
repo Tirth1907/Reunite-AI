@@ -262,6 +262,8 @@ export interface Detection {
     timestamp_display: string;
     confidence: number;
     cropped_face_url: string;
+    face_thumbnail: string | null;
+    case_id: string;
     is_low_confidence: boolean;
     detected_at: string | null;
 }
@@ -320,6 +322,23 @@ export async function getVideoResults(caseId: string): Promise<VideoResults> {
     }
 
     const response = await fetch(`${API_BASE_V2}/video/results/${caseId}`, { headers });
+
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({ detail: 'Results fetch failed' }));
+        throw new Error(error.detail || `HTTP error ${response.status}`);
+    }
+
+    return response.json();
+}
+
+export async function getResultsByVideo(videoId: string): Promise<VideoResults> {
+    const token = localStorage.getItem('reunite_token');
+    const headers: Record<string, string> = {};
+    if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+    }
+
+    const response = await fetch(`${API_BASE_V2}/video/video-results/${videoId}`, { headers });
 
     if (!response.ok) {
         const error = await response.json().catch(() => ({ detail: 'Results fetch failed' }));

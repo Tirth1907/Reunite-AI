@@ -30,6 +30,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+@app.on_event("startup")
+async def startup_event():
+    from pages.helper.model_cache import warm_up
+    warm_up()
+
 # CORS configuration - allow frontend
 app.add_middleware(
     CORSMiddleware,
